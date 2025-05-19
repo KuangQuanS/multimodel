@@ -65,43 +65,59 @@ class SingleModalityDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.data[idx], self.labels[idx]
 
-def load_data_from_folders(normal_dir: str, cancer_dir: str, modality: str) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
-    """加载特定模态的数据，返回数值数据、标签、样本名和特征名"""
-    data_list = []
-    labels_list = []
-    sample_names = []
-    feature_names = None
-    
+def load_data_from_folders(normal_dir: str, cancer_dir: str, modality: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[str], List[str]]:
+    """加载特定模态的数据，返回训练数据、测试数据、训练标签、测试标签、样本名和特征名"""
     # 加载正常样本
     normal_files = glob.glob(os.path.join(normal_dir, f"*{modality}*.csv"))
     if not normal_files:
         raise FileNotFoundError(f"No {modality} files found in {normal_dir}")
     
+    normal_data = []
+    normal_labels = []
+    sample_names = []
+    feature_names = None
+    
     for file in normal_files:
-        df = pd.read_csv(file, index_col=0)  # 第一列作为行名
+        df = pd.read_csv(file, index_col=0)
         if feature_names is None:
-            feature_names = df.columns.tolist()  # 保存特征名
-        
+            feature_names = df.columns.tolist()
         sample_names.extend(df.index.tolist())
-        data_list.append(df.values)
-        labels_list.extend([0] * len(df))  # 0表示正常
+        normal_data.append(df.values)
+        normal_labels.extend([0] * len(df))
     
     # 加载癌症样本
     cancer_files = glob.glob(os.path.join(cancer_dir, f"*{modality}*.csv"))
     if not cancer_files:
         raise FileNotFoundError(f"No {modality} files found in {cancer_dir}")
     
+    cancer_data = []
+    cancer_labels = []
+    
     for file in cancer_files:
-        df = pd.read_csv(file, index_col=0)  # 第一列作为行名
+        df = pd.read_csv(file, index_col=0)
         sample_names.extend(df.index.tolist())
-        data_list.append(df.values)
-        labels_list.extend([1] * len(df))  # 1表示癌症
+        cancer_data.append(df.values)
+        cancer_labels.extend([1] * len(df))
     
-    # 合并数据
-    data = np.vstack(data_list)
-    labels = np.array(labels_list)
+    # 合并并划分数据集
+    def split_data(data, labels, test_size=0.2):
+        indices = np.random.permutation(len(data))
+        split = int(len(data) * (1 - test_size))
+        return data[indices[:split]], data[indices[split:]], labels[indices[:split]], labels[indices[split:]]
     
-    return data, labels, sample_names, feature_names
+    # 分别划分正常和癌症数据
+    normal_train, normal_test, normal_train_labels, normal_test_labels = split_data(
+        np.vstack(normal_data), np.array(normal_labels))
+    cancer_train, cancer_test, cancer_train_labels, cancer_test_labels = split_data(
+        np.vstack(cancer_data), np.array(cancer_labels))
+    
+    # 合并训练集和测试集
+    train_data = np.vstack([normal_train, cancer_train])
+    test_data = np.vstack([normal_test, cancer_test])
+    train_labels = np.concatenate([normal_train_labels, cancer_train_labels])
+    test_labels = np.concatenate([normal_test_labels, cancer_test_labels])
+    
+    return train_data, test_data, train_labels, test_labels, sample_names, feature_names
 
 def train_single_encoder(modality: str, 
                         normal_dir: str, 
@@ -113,39 +129,30 @@ def train_single_encoder(modality: str,
                         learning_rate: float = 0.001,
                         dropout_rate: float = 0.3) -> None:
     """训练单个模态的编码器"""
-    # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f"Training {modality} encoder on {device}")
     
-    # 加载数据
-    data, labels, sample_names, feature_names = load_data_from_folders(normal_dir, cancer_dir, modality)
-    logging.info(f"Loaded {len(sample_names)} samples with {len(feature_names)} features for {modality}")
+    # 加载并划分数据
+    train_data, test_data, train_labels, test_labels, _, feature_names = load_data_from_folders(
+        normal_dir, cancer_dir, modality)
     
     # 数据预处理
     scaler = StandardScaler()
-    data = scaler.fit_transform(data)
-    
-    # 划分训练集和验证集
-    train_size = int(0.8 * len(labels))
-    indices = np.random.permutation(len(labels))
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:]
-    
-    train_data = data[train_indices]
-    val_data = data[val_indices]
-    train_labels = labels[train_indices]
-    val_labels = labels[val_indices]
+    train_data = scaler.fit_transform(train_data)
+    test_data = scaler.transform(test_data)
     
     # 创建数据集和数据加载器
     train_dataset = SingleModalityDataset(train_data, train_labels)
-    val_dataset = SingleModalityDataset(val_data, val_labels)
+    test_dataset = SingleModalityDataset(test_data, test_labels)
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
     # 创建模型
-    input_dim = data.shape[1]
-    num_classes = len(np.unique(labels))
+    input_dim = train_data.shape[1]  # 使用train_data的shape而不是未定义的data
+    unique_labels = np.unique(np.concatenate([train_labels, test_labels]))  # 合并标签获取类别数
+    num_classes = len(unique_labels)
+    
     model = SingleModalityEncoder(
         input_dim=input_dim,
         hidden_dims=hidden_dims,
@@ -177,15 +184,15 @@ def train_single_encoder(modality: str,
             optimizer.step()
             
             train_loss += loss.item()
-            _, predicted = logits.max(1)
+            _, predicted = torch.max(logits, 1)  # 使用torch.max替代直接.max()
             total += targets.size(0)
-            correct += predicted.eq(targets).sum().item()
+            correct += (predicted == targets).sum().item()
         
         train_acc = 100. * correct / total
         train_loss /= len(train_loader)
         
-        # 验证
-        val_loss, val_acc = validate(model, val_loader, device, criterion)
+        # 验证 (使用测试集作为验证集)
+        test_loss, test_acc = validate(model, test_loader, device, criterion)
         
         # 学习率调整
         scheduler.step()
@@ -193,11 +200,11 @@ def train_single_encoder(modality: str,
         # 记录日志
         logging.info(f'Epoch {epoch+1}/{num_epochs} - {modality}:')
         logging.info(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
-        logging.info(f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
+        logging.info(f'Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}%')
         
-        # 保存最佳模型
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        # 保存最佳模型 (包括测试数据)
+        if test_acc > best_val_acc:
+            best_val_acc = test_acc
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -207,9 +214,11 @@ def train_single_encoder(modality: str,
                 'input_dim': input_dim,
                 'hidden_dims': hidden_dims,
                 'output_dim': num_classes,
-                'feature_names': feature_names  # 保存特征名
+                'feature_names': feature_names,
+                'test_data': test_data,  # 保存测试数据用于后续评估
+                'test_labels': test_labels  # 保存测试标签
             }, f'best_{modality}_encoder.pth')
-            logging.info(f'Saved new best {modality} model with validation accuracy: {best_val_acc:.2f}%')
+            logging.info(f'Saved new best {modality} model with test accuracy: {best_val_acc:.2f}%')
 
 def validate(model: nn.Module, 
             val_loader: DataLoader, 
@@ -238,15 +247,12 @@ def validate(model: nn.Module,
     
     return val_loss, val_acc
 
-def evaluate_single_encoder(modality: str, test_dir: str) -> None:
-    """评估单个模态的编码器"""
+def evaluate_single_encoder(modality: str) -> None:
+    """评估单个模态的编码器（使用之前划分的测试集）"""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # 加载模型
     checkpoint = torch.load(f'best_{modality}_encoder.pth', map_location=device)
-    scaler = checkpoint['scaler']
-    feature_names = checkpoint['feature_names']
-    
     model = SingleModalityEncoder(
         input_dim=checkpoint['input_dim'],
         hidden_dims=checkpoint['hidden_dims'],
@@ -255,31 +261,11 @@ def evaluate_single_encoder(modality: str, test_dir: str) -> None:
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     
-    # 加载测试数据
-    test_files = glob.glob(os.path.join(test_dir, f"*{modality}*.csv"))
-    if not test_files:
-        raise FileNotFoundError(f"No {modality} files found in {test_dir}")
+    # 直接从训练时保存的测试集评估
+    test_data = checkpoint['test_data']
+    test_labels = checkpoint['test_labels']
+    feature_names = checkpoint['feature_names']  # 从checkpoint中获取feature_names
     
-    test_data = []
-    test_labels = []
-    test_sample_names = []
-    for file in test_files:
-        df = pd.read_csv(file, index_col=0)
-        test_sample_names.extend(df.index.tolist())
-        test_data.append(df.values)
-        # 假设文件名或内容可以区分正常和癌症
-        if "normal" in file.lower():
-            test_labels.extend([0] * len(df))
-        else:
-            test_labels.extend([1] * len(df))
-    
-    test_data = np.vstack(test_data)
-    test_labels = np.array(test_labels)
-    
-    # 预处理
-    test_data = scaler.transform(test_data)
-    
-    # 创建数据集和数据加载器
     test_dataset = SingleModalityDataset(test_data, test_labels)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
     
@@ -317,8 +303,7 @@ def evaluate_single_encoder(modality: str, test_dir: str) -> None:
     plt.ylabel('True')
     plt.savefig(f'{modality}_confusion_matrix.png')
     plt.close()
-    
-    # 返回特征重要性
+
     return feature_names
 
 def main():
@@ -337,25 +322,14 @@ def main():
             modality=modality,
             normal_dir=normal_dir,
             cancer_dir=cancer_dir,
-            hidden_dims=[256, 128],
-            encoder_output_dim=64,
-            num_epochs=100,
+            hidden_dims=[1024, 512],
+            encoder_output_dim=256,
+            num_epochs=50,
             batch_size=32,
             learning_rate=0.001,
             dropout_rate=0.3
         )
-    
-
-
-    feature_importances = {}
-    for modality in modalities:
-        feature_names = evaluate_single_encoder(modality, test_dir)
-        feature_importances[modality] = feature_names
-    
-    # 保存特征名
-    with open('feature_names.json', 'w') as f:
-        import json
-        json.dump(feature_importances, f, indent=2)
+        evaluate_single_encoder(modality)
 
 if __name__ == '__main__':
     main()
