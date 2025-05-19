@@ -130,6 +130,7 @@ def train_single_encoder(modality: str,
                         dropout_rate: float = 0.3) -> None:
     """训练单个模态的编码器"""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logging.info(f"------------------------------------------------------------------------")
     logging.info(f"Training {modality} encoder on {device}")
     
     # 加载并划分数据
@@ -198,7 +199,7 @@ def train_single_encoder(modality: str,
         scheduler.step()
         
         # 记录日志
-        if epoch % 10 == 0:
+        if epoch % 25 == 0:
             logging.info(f'Epoch {epoch+1}/{num_epochs} - {modality}:')
             logging.info(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
             logging.info(f'Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}%')
@@ -319,15 +320,16 @@ def main():
     # 数据路径 - 请替换为您的实际路径
     normal_dir = "../database/cfDNA/normal"  # 正常样本目录
     cancer_dir = "../database/cfDNA/cancer"  # 癌症样本目录
-    
+    h_dims=[2048, 1024, 512]
     # 训练所有模态的编码器
     modalities = ['Frag', 'CNV', 'PFE', 'NDR', 'NDR2K']
+    logging.info(f"---------------------encoder dim:{h_dims}---------------------")
     for modality in modalities:
         train_single_encoder(
             modality=modality,
             normal_dir=normal_dir,
             cancer_dir=cancer_dir,
-            hidden_dims=[2048, 1024, 512],
+            hidden_dims=h_dims,
             encoder_output_dim=256,
             num_epochs=100,
             batch_size=16,
