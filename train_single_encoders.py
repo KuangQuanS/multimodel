@@ -20,7 +20,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(f'training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
+        logging.FileHandler(f'./log/training_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.log'),
         logging.StreamHandler()
     ]
 )
@@ -198,9 +198,10 @@ def train_single_encoder(modality: str,
         scheduler.step()
         
         # 记录日志
-        logging.info(f'Epoch {epoch+1}/{num_epochs} - {modality}:')
-        logging.info(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
-        logging.info(f'Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}%')
+        if epoch % 10 == 0:
+            logging.info(f'Epoch {epoch+1}/{num_epochs} - {modality}:')
+            logging.info(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
+            logging.info(f'Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}%')
         
         # 保存最佳模型 (包括测试数据)
         if test_acc > best_val_acc:
@@ -214,10 +215,10 @@ def train_single_encoder(modality: str,
                 'input_dim': input_dim,
                 'hidden_dims': hidden_dims,
                 'output_dim': num_classes,
-                'feature_names': feature_names,
-                'test_data': test_data,  # 保存测试数据用于后续评估
-                'test_labels': test_labels  # 保存测试标签
-            }, f'best_{modality}_encoder.pth')
+                'feature_names': feature_names
+                # 'test_data': test_data,  # 保存测试数据用于后续评估
+                # 'test_labels': test_labels  # 保存测试标签
+            }, f'./checkpoint/best_{modality}_encoder.pth')
             logging.info(f'Saved new best {modality} model with test accuracy: {best_val_acc:.2f}%')
 
 def validate(model: nn.Module, 
@@ -247,12 +248,12 @@ def validate(model: nn.Module,
     
     return val_loss, val_acc
 
-def evaluate_single_encoder(modality: str) -> None:
-    """评估单个模态的编码器（使用之前划分的测试集）"""
+def evaluate_single_encoder(modality: str, normal_dir: str, cancer_dir: str) -> None:
+    """评估单个模态的编码器（从原始文件夹重新加载测试数据）"""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # 加载模型
-    checkpoint = torch.load(f'best_{modality}_encoder.pth', map_location=device)
+    checkpoint = torch.load(f'./checkpoint/best_{modality}_encoder.pth', map_location=device)
     model = SingleModalityEncoder(
         input_dim=checkpoint['input_dim'],
         hidden_dims=checkpoint['hidden_dims'],
@@ -261,11 +262,15 @@ def evaluate_single_encoder(modality: str) -> None:
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     
-    # 直接从训练时保存的测试集评估
-    test_data = checkpoint['test_data']
-    test_labels = checkpoint['test_labels']
-    feature_names = checkpoint['feature_names']  # 从checkpoint中获取feature_names
+    # 重新从文件夹加载测试数据
+    _, test_data, _, test_labels, _, feature_names = load_data_from_folders(
+        normal_dir, cancer_dir, modality)
     
+    # 使用保存的scaler预处理数据
+    scaler = checkpoint['scaler']
+    test_data = scaler.transform(test_data)
+    
+    # 创建测试数据集
     test_dataset = SingleModalityDataset(test_data, test_labels)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
     
@@ -322,14 +327,14 @@ def main():
             modality=modality,
             normal_dir=normal_dir,
             cancer_dir=cancer_dir,
-            hidden_dims=[1024, 512],
+            hidden_dims=[2048, 1024, 512],
             encoder_output_dim=256,
-            num_epochs=50,
-            batch_size=32,
+            num_epochs=100,
+            batch_size=16,
             learning_rate=0.001,
             dropout_rate=0.3
         )
-        evaluate_single_encoder(modality)
+        #evaluate_single_encoder(modality)
 
 if __name__ == '__main__':
     main()
