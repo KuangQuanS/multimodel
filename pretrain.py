@@ -16,7 +16,7 @@ def train_mae(modality, data_tensor, args):
         dataset, [train_size, val_size],
         generator=torch.Generator().manual_seed(42)
     )
-    
+
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
 
@@ -72,7 +72,7 @@ def train_mae(modality, data_tensor, args):
             torch.save(model.encoder.state_dict(), best_model_path)
 
         # 打印进度
-        if epoch % 50 == 0 or epoch==1:
+        if epoch % 20 == 0 or epoch==1:
             print(f"[{modality}] Epoch {epoch}/{args.epochs}  "
                   f"Train Loss: {train_loss:.4f}  Val Loss: {val_loss:.4f}")
 
@@ -99,23 +99,20 @@ def train_mae(modality, data_tensor, args):
     plt.close()
     print(f"[{modality}] Loss curves saved to {save_path}")
 
-
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--modalities", nargs="+", required=True)
     parser.add_argument("--data_root", type=str, required=True,
                         help="每个模态的 .npz 数据路径，形如 data/{modality}.npz")
     parser.add_argument("--save_dir",  type=str, default="./pretrained")
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs",     type=int, default=100)
     parser.add_argument("--latent_dim", type=int, default=256)
-    parser.add_argument("--enc_layers", type=int, default=4)
+    parser.add_argument("--enc_layers", type=int, default=3)
     parser.add_argument("--dec_layers", type=int, default=2)
     parser.add_argument("--n_heads",    type=int, default=8)
     parser.add_argument("--mlp_ratio",  type=float, default=4.0)
-    parser.add_argument("--mask_ratio", type=float, default=0.3)
+    parser.add_argument("--mask_ratio", type=float, default=0.25)
     parser.add_argument("--lr",         type=float, default=1e-4)
     parser.add_argument("--device",     type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
