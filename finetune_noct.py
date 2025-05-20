@@ -30,7 +30,7 @@ class FusionWithDomain(nn.Module):
             dim_feedforward=dim_latent*4, batch_first=True, dropout=dropout
         )
         self.fusion = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        self.cls_head = nn.Linear(dim_latent, num_classes)
+        self.cls_head = nn.Linear(dim_latent*5, num_classes)
         self.dom_head = nn.Sequential(
             nn.Linear(dim_latent, dim_latent//2),
             nn.ReLU(),
@@ -39,17 +39,19 @@ class FusionWithDomain(nn.Module):
 
     def forward(self, zs, domain_mat, lambd=1.0):
         B, M, D = zs.shape
-        fused = self.fusion(zs)
-        agg = fused.mean(dim=1)
+        fused = self.fusion(zs)                  # [B, M, D]
+        
+        # 拼接所有模态用于分类
+        agg = fused.reshape(B, -1)               # [B, M*D]
         logits_cls = self.cls_head(agg)
 
-        # 域判别
-        z_flat = agg.unsqueeze(1).expand(-1, M, -1).reshape(B*M, D)
-        dom_labels = domain_mat.reshape(B*M)
-        z_rev = grad_reverse(z_flat, lambd)
-        logits_dom = self.dom_head(z_rev)
+        # 每个模态分别判别（基于原始 [B, M, D]）
+        z_flat = grad_reverse(fused.reshape(B*M, D), lambd)  # [B*M, D]
+        dom_labels = domain_mat.reshape(B*M)                 # [B*M]
+        logits_dom = self.dom_head(z_flat)
 
         return logits_cls, logits_dom, dom_labels
+
 
 # 3. 多模态数据集 + 支持子集选择
 class MultiModalDataset(Dataset):
