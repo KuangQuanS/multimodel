@@ -15,12 +15,13 @@ class ModalityMAE(nn.Module):
         # 投影到 latent 维度
         self.encoder_embed = nn.Linear(dim_in, dim_latent)
         # Transformer Encoder
-        encoder_layer = nn.TransformerEncoderLayer(d_model=dim_latent, nhead=n_heads, dim_feedforward=int(dim_latent*mlp_ratio))
+        encoder_layer = nn.TransformerEncoderLayer(d_model=dim_latent, nhead=n_heads, dim_feedforward=int(dim_latent*mlp_ratio), batch_first=True)
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=encoder_layers)
         # Decoder: 从 latent 恢复到原始维度
-        self.decoder_embed = nn.Linear(dim_latent, dim_in)
-        decoder_layer = nn.TransformerEncoderLayer(d_model=dim_in, nhead=n_heads, dim_feedforward=int(dim_in*mlp_ratio))
+        decoder_layer = nn.TransformerEncoderLayer(d_model=dim_latent, nhead=n_heads, dim_feedforward=int(dim_latent*mlp_ratio), batch_first=True)
         self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=decoder_layers)
+        self.decoder_pred = nn.Linear(dim_latent, dim_in)
+
 
     def random_mask(self, x):
         B, D = x.shape
@@ -31,18 +32,21 @@ class ModalityMAE(nn.Module):
         # x: B×D_in
         mask = self.random_mask(x)        # B×D_in，True 表示保留
         x_masked = x * mask.float()
+        
         # Encoder
         z = self.encoder_embed(x_masked)  # B×D_latent
-        z = z.unsqueeze(1)                # B×1×D_latent（补充 seq len 维度）
+        z = z.unsqueeze(1)                # B×1×D_latent
         z = self.encoder(z)               # B×1×D_latent
         z = z.squeeze(1)                  # B×D_latent
-        # Decoder 重建
-        x_rec = self.decoder_embed(z)     # B×D_in
-        x_rec = x_rec.unsqueeze(1)        # B×1×D_in
-        x_rec = self.decoder(x_rec)       # B×1×D_in
-        x_rec = x_rec.squeeze(1)          # B×D_in
-        # 只计算 mask 掩盖位置的重建误差
+
+        # Decoder 重建（注意：现在是在 latent 空间做 transformer）
+        z = z.unsqueeze(1)                # B×1×D_latent
+        z = self.decoder(z)               # B×1×D_latent
+        z = z.squeeze(1)                  # B×D_latent
+        x_rec = self.decoder_pred(z)      # B×D_in
+
         return x_rec, mask
+
 
 class FusionCrossAttn(nn.Module):
     """
