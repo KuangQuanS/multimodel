@@ -35,15 +35,34 @@ class Fusion(nn.Module):
 # 2) Dataset
 # -----------------------------
 class MultiModalDataset(Dataset):
-    def __init__(self, npz_path, modalities, indices=None):
+    def __init__(self, npz_path, modalities, indices=None, balance_classes=False):
         npz = np.load(npz_path)
         self.Xs_all = [npz[mod] for mod in modalities]
-        self.y_all  = npz["y"]
+        self.y_all = npz["y"]
+        # 默认行为（不balance或indices已提供）
         if indices is None:
             indices = np.arange(len(self.y_all))
+        
         self.indices = indices
         self.Xs = [x[indices] for x in self.Xs_all]
-        self.y  = self.y_all[indices]
+        self.y = self.y_all[indices]
+
+        # 如果未指定indices，且需要平衡类别
+        if balance_classes:
+            y = self.y
+            # 获取y=0和y=1的索引
+            idx_0 = np.where(y == 0)[0]  # y=0的索引
+            idx_1 = np.where(y == 1)[0]  # y=1的索引
+            # 随机从y=1中抽取与y=0相同数量的样本
+            n_samples = min(len(idx_0), len(idx_1))
+            idx_0_sampled = np.random.choice(idx_0, size=n_samples, replace=False)
+            # 合并索引
+            indices = np.concatenate([idx_0_sampled, idx_1])
+            np.random.shuffle(indices)  # 打乱顺序
+            self.Xs = [x[indices] for x in self.Xs]
+            self.y = self.y[indices]
+
+
 
     def __len__(self):
         return len(self.y)
@@ -64,7 +83,7 @@ def train(args):
     if args.single_mod is not None:
         # 1) 加载 MAE encoder
         ckpt = torch.load(os.path.join(args.checkpoint_dir, f"{args.single_mod}_best.pth"),
-                          map_location="cpu")
+                          map_location="cpu", weights_only=True)
         dim_in = ckpt['encoder_embed.weight'].shape[1]
         mae = ModalityMAE(
             dim_in=dim_in,
@@ -82,25 +101,56 @@ def train(args):
         mae.encoder.load_state_dict({k:v for k,v in ckpt.items() if k.startswith('layers.')})
         mae.eval(); mae.to(args.device)
 
-        # 2) 构建单模态 DataLoader
+        # 2) 构建单模态 DataLoader（带类别平衡）
         data = np.load(args.data_file)
         X = data[args.single_mod]
         y = data['y']
-        N = len(y)
-        idx = np.random.permutation(N)
-        split = int(N*args.val_ratio)
-        train_idx, val_idx = idx[split:], idx[:split]
+                # —— 核心修改：实现类别平衡 ——
+        def get_balanced_indices(y, split_ratio=0.3, use=False, val_use=False):
+            N = len(y)
+            idx = np.random.permutation(N)
+            split = int(N * split_ratio)
+            train_idx_all = idx[split:]
+            val_idx_all = idx[:split]
+
+            if not use:
+                return train_idx_all, val_idx_all
+
+            def balance_indices(indices):
+                y_subset = y[indices]
+                idx_0 = indices[y_subset == 0]
+                idx_1 = indices[y_subset == 1]
+                n_samples = min(len(idx_0), len(idx_1))
+                sampled_idx_0 = np.random.choice(idx_0, size=n_samples, replace=False)
+                sampled_idx_1 = np.random.choice(idx_1, size=n_samples, replace=False)
+                balanced = np.concatenate([sampled_idx_0, sampled_idx_1])
+                np.random.shuffle(balanced)
+                return balanced
+
+            train_idx_balanced = balance_indices(train_idx_all)
+            val_idx_balanced = balance_indices(val_idx_all)
+            if val_use:
+                return train_idx_balanced, val_idx_balanced
+            else:
+                return train_idx_balanced, val_idx_all
+
+        # 使用平衡后的索引
+        train_idx, val_idx = get_balanced_indices(y, args.val_ratio, use=True)
+
         X_train, y_train = X[train_idx], y[train_idx]
-        X_val,   y_val   = X[val_idx],   y[val_idx]
+        X_val, y_val = X[val_idx], y[val_idx]
 
         train_ds = torch.utils.data.TensorDataset(
             torch.from_numpy(X_train).float(), torch.from_numpy(y_train).long()
         )
-        val_ds   = torch.utils.data.TensorDataset(
-            torch.from_numpy(X_val).float(),   torch.from_numpy(y_val).long()
+        print("训练集样本比例:", np.bincount(y_train))
+
+        val_ds = torch.utils.data.TensorDataset(
+            torch.from_numpy(X_val).float(), torch.from_numpy(y_val).long()
         )
+        print("验证集样本比例:", np.bincount(y_val))
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-        val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
 
         # 3) 构建 Fusion（M=1）并训练
         fusion = Fusion(
@@ -162,7 +212,7 @@ def train(args):
     encoders={}
     for mod in args.modalities:
         ckpt = torch.load(os.path.join(args.checkpoint_dir, f"{mod}_best.pth"),
-                          map_location="cpu")
+                          map_location="cpu", weights_only=True)
         dim_in = ckpt['encoder_embed.weight'].shape[1]
         mae = ModalityMAE(
             dim_in=dim_in,
@@ -190,8 +240,10 @@ def train(args):
     idx = np.random.permutation(N)
     split = int(N*args.val_ratio)
     val_idx,train_idx = idx[:split], idx[split:]
-    train_ds = MultiModalDataset(args.data_file, args.modalities, train_idx)
-    val_ds   = MultiModalDataset(args.data_file, args.modalities, val_idx)
+    train_ds = MultiModalDataset(args.data_file, args.modalities, train_idx, balance_classes=True)
+    print("训练集样本比例:", np.bincount(train_ds.y))
+    val_ds   = MultiModalDataset(args.data_file, args.modalities, val_idx, balance_classes=False)
+    print("验证集样本比例:", np.bincount(val_ds.y))
     train_loader=DataLoader(train_ds,batch_size=args.batch_size,shuffle=True)
     val_loader  =DataLoader(val_ds,  batch_size=args.batch_size,shuffle=False)
 
@@ -204,6 +256,7 @@ def train(args):
         num_classes=args.num_classes,
         dropout=args.dropout
     ).to(args.device)
+
     crit = nn.CrossEntropyLoss()
     params = list(fusion.parameters())
     # 如启用 --finetune，则只解冻每个 encoder 最后一层
@@ -217,6 +270,7 @@ def train(args):
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs//3, eta_min=args.lr/10)
 
     best_f1=0.0
+    best_epoch=0
     for epoch in range(1, args.epochs+1):
         fusion.train()
         total=correct=0
@@ -261,13 +315,14 @@ def train(args):
         f1 = f1_score(y_true,y_pred,average="macro")
         if f1>best_f1:
             best_f1=f1
+            best_epoch=epoch
             torch.save(fusion.state_dict(), os.path.join(args.output_dir, "best.pth"))
         if epoch%20==0:
             print(f"Epo{epoch}: TrAcc={train_acc:.2f}% VaAcc={val_acc:.2f}% F1={f1:.4f}")
 
     os.makedirs(args.output_dir, exist_ok=True)
     torch.save(fusion.state_dict(), os.path.join(args.output_dir, "end.pth"))
-    print(f"✅ 多模态最佳 F1: {best_f1:.4f}")
+    print(f"✅ 多模态最佳 F1: {best_f1:.4f}, 最佳 Epoch: {best_epoch}")
 
 if __name__=="__main__":
     p=argparse.ArgumentParser()
