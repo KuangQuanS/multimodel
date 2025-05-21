@@ -1,4 +1,4 @@
-import argparse, os, math
+import argparse, os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,7 +16,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 def load_encoder(mod, args):
     """加载预训练的编码器"""
     ckpt = torch.load(os.path.join(args.checkpoint_dir, f"{mod}_best.pth"),
-                      map_location="cpu")
+                      map_location="cpu", weights_only=True)
     dim_in = ckpt['encoder_embed.weight'].shape[1]
     mae = ModalityMAE(
         dim_in=dim_in,
@@ -359,10 +359,53 @@ def train(args):
     
     print(f"\n✅ 详细结果已保存至: {result_file}")
 
+def evaluate_test_set(fusion, encoders, test_loader, args):
+    """在测试集上评估模型"""
+    fusion.eval()
+    test_true, test_pred, test_probs = [], [], []
+    
+    with torch.no_grad():
+        for batch in test_loader:
+            if args.single_mod is not None:
+                # 单模态模式
+                Xb, yb = batch
+                z = encoders[args.single_mod].encoder(
+                    encoders[args.single_mod].encoder_embed(Xb.to(args.device)).unsqueeze(1)
+                ).squeeze(1)
+                zs = z.unsqueeze(1)
+            else:
+                # 多模态模式
+                Xlist, yb = batch
+                zs = torch.stack([
+                    encoders[mod].encoder(
+                        encoders[mod].encoder_embed(x.to(args.device)).unsqueeze(1)
+                    ).squeeze(1)
+                    for mod, x in zip(args.modalities, Xlist)
+                ], dim=1)
+            
+            logits = fusion(zs)
+            probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+            preds = logits.argmax(1).cpu().numpy()
+            
+            test_true.extend(yb.numpy() if args.single_mod is not None else yb.cpu().numpy())
+            test_pred.extend(preds)
+            test_probs.extend(probs)
+    
+    test_true = np.array(test_true)
+    test_pred = np.array(test_pred)
+    test_probs = np.array(test_probs)
+    
+    acc = (test_true == test_pred).mean() * 100
+    f1 = f1_score(test_true, test_pred, average="macro")
+    auc = roc_auc_score(test_true, test_probs)
+    
+    return acc, f1, auc
+
 if __name__=="__main__":
     p=argparse.ArgumentParser()
     p.add_argument("--modalities",   nargs="+")
-    p.add_argument("--data_file",     type=str, required=True)
+    p.add_argument("--data_file",     type=str, required=True, help="训练数据文件路径")
+    p.add_argument("--test_file",     type=str, required=True, help="测试数据文件路径")
     p.add_argument("--checkpoint_dir",type=str, default="./pretrained")
     p.add_argument("--output_dir",    type=str, default="./fusion_out")
     p.add_argument("--nhead",         type=int, default=8)
@@ -382,7 +425,58 @@ if __name__=="__main__":
     p.add_argument("--encoder_layers",type=int, default=3)
     p.add_argument("--decoder_layers",type=int, default=2)
     p.add_argument("--mask_ratio",    type=float, default=0.25)
-    p.add_argument("--val_ratio",     type=float, default=0.3)
+    p.add_argument("--val_ratio",     type=float, default=0.2, help="验证集比例")
     p.add_argument("--device",        type=str,   default="cuda" if torch.cuda.is_available() else "cpu")
     args=p.parse_args()
+    
+    # 训练模型
     train(args)
+    
+    # 在测试集上评估最佳模型
+    print("\n===== 在测试集上评估最佳模型 =====")
+    
+    # 加载最佳模型（这里使用最后一折的最佳模型）
+    best_fold = 10
+    if args.single_mod is not None:
+        model_path = os.path.join(args.output_dir, f"{args.single_mod}_fusion_fold{best_fold}_best.pth")
+    else:
+        model_path = os.path.join(args.output_dir, f"fold{best_fold}_best.pth")
+    
+    fusion = Fusion(
+        dim_latent=args.latent_dim,
+        n_modalities=1 if args.single_mod is not None else len(args.modalities),
+        nhead=args.nhead,
+        num_layers=args.fusion_layers,
+        num_classes=args.num_classes,
+        dropout=args.dropout
+    ).to(args.device)
+    fusion.load_state_dict(torch.load(model_path, weights_only=True))
+    
+    # 准备测试数据
+    if args.single_mod is not None:
+        test_data = np.load(args.test_file)
+        X_test = torch.from_numpy(test_data[args.single_mod]).float()
+        y_test = torch.from_numpy(test_data['y']).long()
+        test_ds = torch.utils.data.TensorDataset(X_test, y_test)
+    else:
+        test_ds = MultiModalDataset(args.test_file, args.modalities)
+    
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
+    
+    # 加载编码器
+    encoders = {}
+    if args.single_mod is not None:
+        mae = load_encoder(args.single_mod, args)
+        mae.eval()
+        mae.to(args.device)
+        encoders[args.single_mod] = mae
+    else:
+        for mod in args.modalities:
+            mae = load_encoder(mod, args)
+            mae.eval()
+            mae.to(args.device)
+            encoders[mod] = mae
+    
+    # 评估测试集
+    test_acc, test_f1, test_auc = evaluate_test_set(fusion, encoders, test_loader, args)
+    print(f"测试集结果 - Acc: {test_acc:.2f}%, F1: {test_f1:.4f}, AUC: {test_auc:.4f}")
