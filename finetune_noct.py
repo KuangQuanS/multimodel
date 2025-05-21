@@ -7,6 +7,7 @@ from torch.autograd import Function
 from torch.utils.data import Dataset, DataLoader
 from model import ModalityMAE
 from sklearn.metrics import f1_score, roc_auc_score
+from sklearn.model_selection import StratifiedKFold
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # -----------------------------
@@ -198,217 +199,112 @@ class MultiModalDataset(Dataset):
 # 3) 训练逻辑
 # -----------------------------
 def train(args):
+    """统一的训练函数，支持单模态和多模态"""
     torch.manual_seed(42)
     np.random.seed(42)
-
-    # —— 单模态模式 —— 
+    
+    # 确定模式和加载编码器
+    encoders = {}
     if args.single_mod is not None:
-        # 1) 加载 MAE encoder
-        ckpt = torch.load(os.path.join(args.checkpoint_dir, f"{args.single_mod}_best.pth"),
-                          map_location="cpu")
-        dim_in = ckpt['encoder_embed.weight'].shape[1]
-        mae = ModalityMAE(
-            dim_in=dim_in,
-            dim_latent=args.latent_dim,
-            encoder_layers=args.encoder_layers,
-            decoder_layers=args.decoder_layers,
-            n_heads=args.nhead,
-            mlp_ratio=args.mlp_ratio,
-            mask_ratio=args.mask_ratio
-        )
-        mae.encoder_embed.load_state_dict({
-            'weight': ckpt['encoder_embed.weight'],
-            'bias':   ckpt['encoder_embed.bias']
-        })
-        mae.encoder.load_state_dict({k:v for k,v in ckpt.items() if k.startswith('layers.')})
-        mae.eval(); mae.to(args.device)
-
-        # 2) 构建单模态 DataLoader
-        data = np.load(args.data_file)
-        X = data[args.single_mod]
-        y = data['y']
-        N = len(y)
-        idx = np.random.permutation(N)
-        split = int(N*args.val_ratio)
-        train_idx, val_idx = idx[split:], idx[:split]
-        X_train, y_train = X[train_idx], y[train_idx]
-        X_val,   y_val   = X[val_idx],   y[val_idx]
-
-        train_ds = torch.utils.data.TensorDataset(
-            torch.from_numpy(X_train).float(), torch.from_numpy(y_train).long()
-        )
-        val_ds   = torch.utils.data.TensorDataset(
-            torch.from_numpy(X_val).float(),   torch.from_numpy(y_val).long()
-        )
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-        val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
-
-        # 3) 构建 Fusion（M=1）并训练
-        fusion = Fusion(
-            dim_latent=args.latent_dim,
-            n_modalities=1,
-            nhead=args.nhead,
-            num_layers=args.fusion_layers,
-            num_classes=args.num_classes,
-            dropout=args.dropout
-        ).to(args.device)
-
-        optimizer = optim.AdamW(fusion.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        crit = nn.CrossEntropyLoss()
-
-        best_f1 = 0.0
-        for epoch in range(1, args.epochs+1):
-            fusion.train()
-            total=correct=0
-            for Xb, yb in train_loader:
-                Xb, yb = Xb.to(args.device), yb.to(args.device)
-                z = mae.encoder(mae.encoder_embed(Xb).unsqueeze(1)).squeeze(1)  # [B,D]
-                zs = z.unsqueeze(1)  # [B,1,D]
-                logits = fusion(zs)
-                loss = crit(logits, yb)
-                optimizer.zero_grad(); loss.backward(); optimizer.step()
-                preds = logits.argmax(1)
-                total   += yb.size(0)
-                correct += (preds==yb).sum().item()
-            train_acc = correct/total*100
-
-            fusion.eval()
-            v_tot=v_corr=0
-            val_true,val_pred = [],[]
-            with torch.no_grad():
-                for Xb,yb in val_loader:
-                    zb = mae.encoder(mae.encoder_embed(Xb.to(args.device)).unsqueeze(1)).squeeze(1)
-                    logits = fusion(zb.unsqueeze(1))
-                    preds  = logits.argmax(1)
-                    v_tot  += yb.size(0)
-                    v_corr += (preds==yb.to(args.device)).sum().item()
-                    val_true.append(yb.numpy()); val_pred.append(preds.cpu().numpy())
-            val_acc = v_corr/v_tot*100
-            y_true = np.concatenate(val_true); y_pred = np.concatenate(val_pred)
-            f1 = f1_score(y_true, y_pred, average="macro")
-
-            if f1>best_f1:
-                best_f1 = f1
-                os.makedirs(args.output_dir, exist_ok=True)
-                torch.save(fusion.state_dict(),
-                           os.path.join(args.output_dir, f"{args.single_mod}_fusion_best.pth"))
-            if epoch%20==0:
-                print(f"[{args.single_mod}] Epo {epoch}: TrAcc={train_acc:.2f}% VaAcc={val_acc:.2f}% F1={f1:.4f}")
-
-        print(f"✅ 单模态 `{args.single_mod}` 最佳 F1: {best_f1:.4f}")
-        return
-
-    # —— 多模态模式 —— 
-    # 1) 加载所有 MAE encoder
-    encoders={}
-    for mod in args.modalities:
-        ckpt = torch.load(os.path.join(args.checkpoint_dir, f"{mod}_best.pth"),
-                          map_location="cpu")
-        dim_in = ckpt['encoder_embed.weight'].shape[1]
-        mae = ModalityMAE(
-            dim_in=dim_in,
-            dim_latent=args.latent_dim,
-            encoder_layers=args.encoder_layers,
-            decoder_layers=args.decoder_layers,
-            n_heads=args.nhead,
-            mlp_ratio=args.mlp_ratio,
-            mask_ratio=args.mask_ratio
-        )
-        mae.encoder_embed.load_state_dict({
-            'weight': ckpt['encoder_embed.weight'],
-            'bias':   ckpt['encoder_embed.bias']
-        })
-        mae.encoder.load_state_dict({k:v for k,v in ckpt.items() if k.startswith('layers.')})
-        if not args.finetune:
-            mae.eval()
-            for p in mae.parameters(): p.requires_grad=False
+        # 单模态模式
+        mae = load_encoder(args.single_mod, args)
+        mae.eval()
         mae.to(args.device)
-        encoders[mod]=mae
-
-    # 2) 划分数据 & DataLoader
-    arr = np.load(args.data_file)
-    N   = len(arr['y'])
+        encoders[args.single_mod] = mae
+        n_modalities = 1
+        print(f"单模态模式: {args.single_mod}")
+    else:
+        # 多模态模式
+        for mod in args.modalities:
+            mae = load_encoder(mod, args)
+            if not args.finetune:
+                mae.eval()
+                for p in mae.parameters(): p.requires_grad=False
+            mae.to(args.device)
+            encoders[mod] = mae
+        n_modalities = len(args.modalities)
+        print(f"多模态模式: {args.modalities}")
+    
+    # 准备数据
+    train_loader, val_loader = prepare_data(args, args.single_mod is not None)
+    
+    # 显示数据分布
+    data = np.load(args.data_file)
+    y = data['y']
+    N = len(y)
     idx = np.random.permutation(N)
-    split = int(N*args.val_ratio)
-    val_idx,train_idx = idx[:split], idx[split:]
-    train_ds = MultiModalDataset(args.data_file, args.modalities, train_idx)
-    val_ds   = MultiModalDataset(args.data_file, args.modalities, val_idx)
-    train_loader=DataLoader(train_ds,batch_size=args.batch_size,shuffle=True)
-    val_loader  =DataLoader(val_ds,  batch_size=args.batch_size,shuffle=False)
-
-    # 3) 构建 & 训练 Fusion
+    split = int(N * args.val_ratio)
+    train_idx, val_idx = idx[split:], idx[:split]
+    print(f"训练集样本比例: {np.bincount(y[train_idx])}")
+    print(f"验证集样本比例: {np.bincount(y[val_idx])}")
+    
+    # 创建融合模型
     fusion = Fusion(
         dim_latent=args.latent_dim,
-        n_modalities=len(args.modalities),
+        n_modalities=n_modalities,
         nhead=args.nhead,
         num_layers=args.fusion_layers,
         num_classes=args.num_classes,
         dropout=args.dropout
     ).to(args.device)
-    crit = nn.CrossEntropyLoss()
+    
+    # 设置优化器和损失函数
     params = list(fusion.parameters())
-    # 如启用 --finetune，则只解冻每个 encoder 最后一层
-    if args.finetune:
+    if args.finetune and args.single_mod is None:
+        # 如启用 --finetune，则只解冻每个 encoder 最后一层
         for m in encoders.values():
             for p in m.encoder.parameters(): p.requires_grad=False
             last = m.encoder.layers[-1]
             for p in last.parameters(): p.requires_grad=True
             params += list(last.parameters())
+    
     optimizer = optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs//3, eta_min=args.lr/10)
-
-    best_f1=0.0
+    criterion = nn.CrossEntropyLoss()
+    
+    # 设置学习率调度器（仅多模态使用）
+    scheduler = None
+    if args.single_mod is None:
+        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs//3, eta_min=args.lr/10)
+    
+    # 训练循环
+    best_f1 = 0.0
+    best_auc = 0.0
+    best_epoch = 0
+    
     for epoch in range(1, args.epochs+1):
-        fusion.train()
-        total=correct=0
-        for Xlist, y in train_loader:
-            y = y.to(args.device)
-            # 5 路编码堆叠
-            zs = torch.stack([
-                encoders[mod].encoder(
-                    encoders[mod].encoder_embed(x.to(args.device)).unsqueeze(1)
-                ).squeeze(1)
-                for mod,x in zip(args.modalities,Xlist)
-            ], dim=1)  # [B,M,D]
-            logits = fusion(zs)
-            loss = crit(logits,y)
-            optimizer.zero_grad(); loss.backward(); optimizer.step()
-            preds = logits.argmax(1)
-            total   += y.size(0)
-            correct += (preds==y).sum().item()
-        train_acc = correct/total*100
-        scheduler.step()
-
-        fusion.eval()
-        v_tot=v_corr=0
-        val_true,val_pred = [],[]
-        with torch.no_grad():
-            for Xlist,y in val_loader:
-                y=y.to(args.device)
-                zs = torch.stack([
-                    encoders[mod].encoder(
-                        encoders[mod].encoder_embed(x.to(args.device)).unsqueeze(1)
-                    ).squeeze(1)
-                    for mod,x in zip(args.modalities,Xlist)
-                ], dim=1)
-                logits = fusion(zs)
-                preds = logits.argmax(1)
-                v_tot  += y.size(0)
-                v_corr += (preds==y).sum().item()
-                val_true.append(y.cpu().numpy())
-                val_pred.append(preds.cpu().numpy())
-        val_acc = v_corr/v_tot*100
-        y_true=np.concatenate(val_true); y_pred=np.concatenate(val_pred)
-        f1 = f1_score(y_true,y_pred,average="macro")
-        if f1>best_f1:
-            best_f1=f1
-            torch.save(fusion.state_dict(), os.path.join(args.output_dir, "best.pth"))
-        if epoch%20==0:
-            print(f"Epo{epoch}: TrAcc={train_acc:.2f}% VaAcc={val_acc:.2f}% F1={f1:.4f}")
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    torch.save(fusion.state_dict(), os.path.join(args.output_dir, "end.pth"))
-    print(f"✅ 多模态最佳 F1: {best_f1:.4f}")
+        # 训练
+        train_acc = train_epoch(fusion, encoders, train_loader, optimizer, criterion, args, scheduler)
+        
+        # 评估
+        val_acc, f1, auc = evaluate(fusion, encoders, val_loader, args)
+        
+        # 保存最佳模型
+        if f1 > best_f1:
+            best_f1 = f1
+            best_auc = auc
+            best_epoch = epoch
+            os.makedirs(args.output_dir, exist_ok=True)
+            
+            if args.single_mod is not None:
+                save_path = os.path.join(args.output_dir, f"{args.single_mod}_fusion_best.pth")
+            else:
+                save_path = os.path.join(args.output_dir, "best.pth")
+            
+            torch.save(fusion.state_dict(), save_path)
+        
+        # 打印进度
+        if epoch % 20 == 0 or epoch == args.epochs:
+            prefix = f"[{args.single_mod}] " if args.single_mod is not None else ""
+            print(f"{prefix}Epoch {epoch}: TrAcc={train_acc:.2f}% VaAcc={val_acc:.2f}% F1={f1:.4f} AUC={auc:.4f}")
+    
+    # 保存最终模型
+    if args.single_mod is None:
+        os.makedirs(args.output_dir, exist_ok=True)
+        torch.save(fusion.state_dict(), os.path.join(args.output_dir, "end.pth"))
+    
+    # 打印最终结果
+    mode_str = f"单模态 `{args.single_mod}`" if args.single_mod is not None else "多模态"
+    print(f"✅ {mode_str} 最佳结果: F1={best_f1:.4f}, AUC={best_auc:.4f}, Epoch={best_epoch}")
 
 if __name__=="__main__":
     p=argparse.ArgumentParser()
