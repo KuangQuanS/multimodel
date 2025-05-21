@@ -198,8 +198,90 @@ class MultiModalDataset(Dataset):
 # -----------------------------
 # 3) 训练逻辑
 # -----------------------------
+def train_one_fold(fold_idx, train_idx, val_idx, encoders, n_modalities, args):
+    """训练单个折"""
+    # 准备数据
+    if args.single_mod is not None:
+        data = np.load(args.data_file)
+        X = data[args.single_mod]
+        y = data['y']
+        X_train, y_train = X[train_idx], y[train_idx]
+        X_val, y_val = X[val_idx], y[val_idx]
+        
+        train_ds = torch.utils.data.TensorDataset(
+            torch.from_numpy(X_train).float(), 
+            torch.from_numpy(y_train).long()
+        )
+        val_ds = torch.utils.data.TensorDataset(
+            torch.from_numpy(X_val).float(),
+            torch.from_numpy(y_val).long()
+        )
+    else:
+        train_ds = MultiModalDataset(args.data_file, args.modalities, train_idx)
+        val_ds = MultiModalDataset(args.data_file, args.modalities, val_idx)
+    
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
+    
+    # 创建融合模型
+    fusion = Fusion(
+        dim_latent=args.latent_dim,
+        n_modalities=n_modalities,
+        nhead=args.nhead,
+        num_layers=args.fusion_layers,
+        num_classes=args.num_classes,
+        dropout=args.dropout
+    ).to(args.device)
+    
+    # 设置优化器和损失函数
+    params = list(fusion.parameters())
+    if args.finetune and args.single_mod is None:
+        for m in encoders.values():
+            for p in m.encoder.parameters(): p.requires_grad=False
+            last = m.encoder.layers[-1]
+            for p in last.parameters(): p.requires_grad=True
+            params += list(last.parameters())
+    
+    optimizer = optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+    criterion = nn.CrossEntropyLoss()
+    scheduler = None if args.single_mod is not None else CosineAnnealingLR(optimizer, T_max=args.epochs//3, eta_min=args.lr/10)
+    
+    # 训练循环
+    best_f1 = best_auc = 0.0
+    best_epoch = 0
+    
+    for epoch in range(1, args.epochs+1):
+        # 训练
+        train_acc = train_epoch(fusion, encoders, train_loader, optimizer, criterion, args, scheduler)
+        
+        # 评估
+        val_acc, f1, auc = evaluate(fusion, encoders, val_loader, args)
+        
+        # 保存最佳模型
+        if f1 > best_f1:
+            best_f1 = f1
+            best_auc = auc
+            best_epoch = epoch
+            os.makedirs(args.output_dir, exist_ok=True)
+            
+            if args.single_mod is not None:
+                save_path = os.path.join(args.output_dir, f"{args.single_mod}_fusion_fold{fold_idx}_best.pth")
+            else:
+                save_path = os.path.join(args.output_dir, f"fold{fold_idx}_best.pth")
+            
+            torch.save(fusion.state_dict(), save_path)
+        
+        # 打印进度
+        if epoch % 50 == 0 or epoch == args.epochs:
+            prefix = f"[{args.single_mod}] " if args.single_mod is not None else ""
+            print(f"{prefix}Fold {fold_idx}, Epoch {epoch}: "
+                  f"TrAcc={train_acc:.2f}% VaAcc={val_acc:.2f}% "
+                  f"F1={f1:.4f} AUC={auc:.4f}")
+    
+    return best_f1, best_auc, best_epoch
+
 def train(args):
-    """统一的训练函数，支持单模态和多模态"""
+    """统一的训练函数，支持单模态和多模态，使用十折交叉验证"""
     torch.manual_seed(42)
     np.random.seed(42)
     
@@ -225,86 +307,57 @@ def train(args):
         n_modalities = len(args.modalities)
         print(f"多模态模式: {args.modalities}")
     
-    # 准备数据
-    train_loader, val_loader = prepare_data(args, args.single_mod is not None)
-    
-    # 显示数据分布
+    # 准备十折交叉验证
     data = np.load(args.data_file)
     y = data['y']
-    N = len(y)
-    idx = np.random.permutation(N)
-    split = int(N * args.val_ratio)
-    train_idx, val_idx = idx[split:], idx[:split]
-    print(f"训练集样本比例: {np.bincount(y[train_idx])}")
-    print(f"验证集样本比例: {np.bincount(y[val_idx])}")
+    skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
     
-    # 创建融合模型
-    fusion = Fusion(
-        dim_latent=args.latent_dim,
-        n_modalities=n_modalities,
-        nhead=args.nhead,
-        num_layers=args.fusion_layers,
-        num_classes=args.num_classes,
-        dropout=args.dropout
-    ).to(args.device)
+    # 存储每折的结果
+    fold_results = []
     
-    # 设置优化器和损失函数
-    params = list(fusion.parameters())
-    if args.finetune and args.single_mod is None:
-        # 如启用 --finetune，则只解冻每个 encoder 最后一层
-        for m in encoders.values():
-            for p in m.encoder.parameters(): p.requires_grad=False
-            last = m.encoder.layers[-1]
-            for p in last.parameters(): p.requires_grad=True
-            params += list(last.parameters())
-    
-    optimizer = optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
-    criterion = nn.CrossEntropyLoss()
-    
-    # 设置学习率调度器（仅多模态使用）
-    scheduler = None
-    if args.single_mod is None:
-        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs//3, eta_min=args.lr/10)
-    
-    # 训练循环
-    best_f1 = 0.0
-    best_auc = 0.0
-    best_epoch = 0
-    
-    for epoch in range(1, args.epochs+1):
-        # 训练
-        train_acc = train_epoch(fusion, encoders, train_loader, optimizer, criterion, args, scheduler)
+    # 十折交叉验证
+    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(y)), y), 1):
+        print(f"\n===== 开始第 {fold_idx}/10 折 =====")
+        print(f"训练集样本比例: {np.bincount(y[train_idx])}")
+        print(f"验证集样本比例: {np.bincount(y[val_idx])}")
         
-        # 评估
-        val_acc, f1, auc = evaluate(fusion, encoders, val_loader, args)
+        # 训练当前折
+        best_f1, best_auc, best_epoch = train_one_fold(
+            fold_idx, train_idx, val_idx, encoders, n_modalities, args
+        )
         
-        # 保存最佳模型
-        if f1 > best_f1:
-            best_f1 = f1
-            best_auc = auc
-            best_epoch = epoch
-            os.makedirs(args.output_dir, exist_ok=True)
-            
-            if args.single_mod is not None:
-                save_path = os.path.join(args.output_dir, f"{args.single_mod}_fusion_best.pth")
-            else:
-                save_path = os.path.join(args.output_dir, "best.pth")
-            
-            torch.save(fusion.state_dict(), save_path)
-        
-        # 打印进度
-        if epoch % 20 == 0 or epoch == args.epochs:
-            prefix = f"[{args.single_mod}] " if args.single_mod is not None else ""
-            print(f"{prefix}Epoch {epoch}: TrAcc={train_acc:.2f}% VaAcc={val_acc:.2f}% F1={f1:.4f} AUC={auc:.4f}")
+        fold_results.append({
+            'fold': fold_idx,
+            'f1': best_f1,
+            'auc': best_auc,
+            'epoch': best_epoch
+        })
+        print(f"第 {fold_idx} 折最佳结果: F1={best_f1:.4f}, AUC={best_auc:.4f}, Epoch={best_epoch}")
     
-    # 保存最终模型
-    if args.single_mod is None:
-        os.makedirs(args.output_dir, exist_ok=True)
-        torch.save(fusion.state_dict(), os.path.join(args.output_dir, "end.pth"))
+    # 计算并打印总体结果
+    f1_scores = [res['f1'] for res in fold_results]
+    auc_scores = [res['auc'] for res in fold_results]
     
-    # 打印最终结果
     mode_str = f"单模态 `{args.single_mod}`" if args.single_mod is not None else "多模态"
-    print(f"✅ {mode_str} 最佳结果: F1={best_f1:.4f}, AUC={best_auc:.4f}, Epoch={best_epoch}")
+    print(f"\n===== {mode_str}十折交叉验证结果 =====")
+    print(f"平均 F1: {np.mean(f1_scores):.4f} ± {np.std(f1_scores):.4f}")
+    print(f"平均 AUC: {np.mean(auc_scores):.4f} ± {np.std(auc_scores):.4f}")
+    
+    # 保存详细结果
+    os.makedirs(args.output_dir, exist_ok=True)
+    result_file = os.path.join(args.output_dir, 
+                              f"{'single_'+args.single_mod if args.single_mod else 'multi'}_cv_results.txt")
+    
+    with open(result_file, 'w') as f:
+        f.write(f"{mode_str}十折交叉验证结果:\n")
+        f.write(f"平均 F1: {np.mean(f1_scores):.4f} ± {np.std(f1_scores):.4f}\n")
+        f.write(f"平均 AUC: {np.mean(auc_scores):.4f} ± {np.std(auc_scores):.4f}\n\n")
+        f.write("各折详细结果:\n")
+        for res in fold_results:
+            f.write(f"Fold {res['fold']}: F1={res['f1']:.4f}, AUC={res['auc']:.4f}, "
+                   f"Best Epoch={res['epoch']}\n")
+    
+    print(f"\n✅ 详细结果已保存至: {result_file}")
 
 if __name__=="__main__":
     p=argparse.ArgumentParser()
