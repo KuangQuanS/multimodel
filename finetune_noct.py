@@ -162,6 +162,8 @@ class Fusion(nn.Module):
             dim_feedforward=dim_latent*4, batch_first=True, dropout=dropout
         )
         self.fusion = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.bn = nn.BatchNorm1d(dim_latent * n_modalities)
+        self.dropout  = nn.Dropout(p=0.5)  
         # 分类头，输入维度 dim_latent * n_modalities
         self.cls_head = nn.Linear(dim_latent * n_modalities, num_classes)
 
@@ -170,6 +172,8 @@ class Fusion(nn.Module):
         B, M, D = zs.shape
         fused = self.fusion(zs)         # [B, M, D]
         agg = fused.reshape(B, M*D)     # [B, M*D]
+        agg = self.bn(agg)
+        agg = self.dropout(agg)
         logits = self.cls_head(agg)     # [B, num_classes]
         return logits
 
