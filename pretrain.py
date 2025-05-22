@@ -3,53 +3,42 @@ import numpy as np
 import matplotlib.pyplot as plt  # 新增
 from torch.utils.data import TensorDataset, DataLoader
 
-class ModalityMAE(nn.Module):
+class ModalityEncoder(nn.Module):
     """
-    单模态的 Masked Autoencoder
+    单模态的编码器-解码器网络
     输入: x ∈ R^(B×D_in)
     输出: 重建 x_hat ∈ R^(B×D_in)
     Encoder 输出 latent z ∈ R^(B×D_latent)
     """
-    def __init__(self, dim_in, dim_latent=256, encoder_layers=4, decoder_layers=2,
-                 n_heads=8, mlp_ratio=4., mask_ratio=0.3):
+    def __init__(self, dim_in, dim_latent=256, hidden_dim=512):
         super().__init__()
-        self.mask_ratio = mask_ratio
-        # 投影到 latent 维度
-        self.encoder_embed = nn.Linear(dim_in, dim_latent)
-        # Transformer Encoder
-        encoder_layer = nn.TransformerEncoderLayer(d_model=dim_latent, nhead=n_heads, dim_feedforward=int(dim_latent*mlp_ratio), batch_first=True)
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=encoder_layers)
-        # Decoder: 从 latent 恢复到原始维度
-        decoder_layer = nn.TransformerEncoderLayer(d_model=dim_latent, nhead=n_heads, dim_feedforward=int(dim_latent*mlp_ratio), batch_first=True)
-        self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=decoder_layers)
-        self.decoder_pred = nn.Linear(dim_latent, dim_in)
-
-
-    def random_mask(self, x):
-        B, D = x.shape
-        mask = torch.rand(B, D, device=x.device) > self.mask_ratio
-        return mask
+        # 编码器
+        self.encoder = nn.Sequential(
+            nn.Linear(dim_in, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, dim_latent),
+            nn.BatchNorm1d(dim_latent)
+        )
+        
+        # 解码器
+        self.decoder = nn.Sequential(
+            nn.Linear(dim_latent, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, dim_in)
+        )
 
     def forward(self, x):
-        # x: B×D_in
-        mask = self.random_mask(x)        # B×D_in，True 表示保留
-        x_masked = x * mask.float()
-        
-        # Encoder
-        z = self.encoder_embed(x_masked)  # B×D_latent
-        z = z.unsqueeze(1)                # B×1×D_latent
-        z = self.encoder(z)               # B×1×D_latent
-        z = z.squeeze(1)                  # B×D_latent
-
-        # Decoder 重建（注意：现在是在 latent 空间做 transformer）
-        z = z.unsqueeze(1)                # B×1×D_latent
-        z = self.decoder(z)               # B×1×D_latent
-        z = z.squeeze(1)                  # B×D_latent
-        x_rec = self.decoder_pred(z)      # B×D_in
-
-        return x_rec, mask
+        # 编码
+        z = self.encoder(x)  # B×D_latent
+        # 解码
+        x_rec = self.decoder(z)  # B×D_in
+        return x_rec, z
     
-def train_mae(modality, data_tensor, args):
+def train_encoder(modality, data_tensor, args):
     device = args.device
     dataset = TensorDataset(data_tensor)
 
@@ -65,15 +54,16 @@ def train_mae(modality, data_tensor, args):
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
 
-    model = ModalityMAE(dim_in=data_tensor.size(1),
-                        dim_latent=args.latent_dim,
-                        encoder_layers=args.enc_layers,
-                        decoder_layers=args.dec_layers,
-                        n_heads=args.n_heads,
-                        mlp_ratio=args.mlp_ratio,
-                        mask_ratio=args.mask_ratio).to(device)
+    # 创建模型
+    model = ModalityEncoder(
+        dim_in=data_tensor.size(1),
+        dim_latent=args.latent_dim,
+        hidden_dim=args.hidden_dim
+    ).to(device)
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    
+    # 使用MSE损失进行重建任务
     criterion = nn.MSELoss()
 
     train_history, val_history = [], []
@@ -88,8 +78,9 @@ def train_mae(modality, data_tensor, args):
         train_loss = 0.
         for (x,) in train_loader:
             x = x.to(device)
-            x_rec, mask = model(x)
-            loss = criterion(x_rec[~mask], x[~mask])
+            x_rec, z = model(x)
+            # 使用重建损失
+            loss = criterion(x_rec, x)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -102,8 +93,8 @@ def train_mae(modality, data_tensor, args):
         with torch.no_grad():
             for (x,) in val_loader:
                 x = x.to(device)
-                x_rec, mask = model(x)
-                loss = criterion(x_rec[~mask], x[~mask])
+                x_rec, z = model(x)
+                loss = criterion(x_rec, x)
                 val_loss += loss.item()
         val_loss /= len(val_loader)
 
@@ -114,12 +105,8 @@ def train_mae(modality, data_tensor, args):
         if val_loss < best_loss:
             best_loss = val_loss
             best_epoch = epoch
-            best_dict = {
-                'encoder_embed.weight': model.encoder_embed.weight,
-                'encoder_embed.bias':   model.encoder_embed.bias,
-                **model.encoder.state_dict()
-            }
-            torch.save(best_dict, best_model_path)
+            # 保存编码器部分
+            torch.save(model.encoder.state_dict(), best_model_path)
 
         # 打印进度
         if epoch % 20 == 0 or epoch==1:
@@ -139,7 +126,7 @@ def train_mae(modality, data_tensor, args):
              f"  min={best_loss:.4f}\n  epoch={best_epoch}",
              verticalalignment='bottom', fontsize=9)
     plt.xlabel("Epoch"); plt.ylabel("MSE Loss")
-    plt.title(f"{modality} MAE Loss Curves")
+    plt.title(f"{modality} Autoencoder Loss Curves")
     plt.grid(True); plt.legend()
     save_path = os.path.join(
         args.save_dir,
@@ -152,17 +139,13 @@ def train_mae(modality, data_tensor, args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--modalities", nargs="+", required=True)
-    parser.add_argument("--data_root", type=str, required=True,
-                        help="每个模态的 .npz 数据路径，形如 data/{modality}.npz")
+    parser.add_argument("--data_file", type=str, required=True,
+                        help="包含所有模态和标签的NPZ文件路径")
     parser.add_argument("--save_dir",  type=str, default="./pretrained")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epochs",     type=int, default=50)
     parser.add_argument("--latent_dim", type=int, default=64)
-    parser.add_argument("--enc_layers", type=int, default=2)
-    parser.add_argument("--dec_layers", type=int, default=2)
-    parser.add_argument("--n_heads",    type=int, default=8)
-    parser.add_argument("--mlp_ratio",  type=float, default=4.0)
-    parser.add_argument("--mask_ratio", type=float, default=0.25)
+    parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--lr",         type=float, default=1e-4)
     parser.add_argument("--device",     type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
@@ -170,9 +153,10 @@ if __name__ == "__main__":
                     help="验证集比例，0~1 之间")
     args = parser.parse_args()
 
+    # 加载数据
+    data = np.load(args.data_file)
+    
     for mod in args.modalities:
-        npz_path = os.path.join(args.data_root, f"{mod}.npz")
-        npzfile = np.load(npz_path)
-        X = npzfile["X"]
-        data = torch.from_numpy(X).float().to(args.device)
-        train_mae(mod, data, args)
+        print(f"Training Autoencoder for {mod}...")
+        X = torch.from_numpy(data[mod]).float()
+        train_encoder(mod, X, args)
