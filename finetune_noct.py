@@ -34,29 +34,33 @@ def load_encoder(mod, checkpoint_dir, latent_dim):
     encoder.encoder.load_state_dict(ckpt)
     return encoder
 
-class MLPFusion(nn.Module):
-    """MLP-based fusion module"""
-    def __init__(self, dim_latent, n_modalities, num_classes=2, hidden_dim=512, dropout=0.3):
+class Conv1dFusion(nn.Module):
+    def __init__(self, dim_latent, n_modalities, num_classes=2,
+                 conv_channels=64, dropout=0.3):
         super().__init__()
-        self.fusion_mlp = nn.Sequential(
-            nn.Linear(dim_latent * n_modalities, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
+        # 在模态维上卷积：channels = dim_latent, 序列长度 = n_modalities
+        self.conv = nn.Sequential(
+            nn.Conv1d(in_channels=dim_latent,
+                      out_channels=conv_channels,
+                      kernel_size=n_modalities,  # 一次性看全体模态
+                      bias=False),
+            nn.BatchNorm1d(conv_channels),
+            nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            
-            nn.Linear(hidden_dim, hidden_dim//2),
-            nn.BatchNorm1d(hidden_dim//2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            
-            nn.Linear(hidden_dim//2, num_classes)
+            # 池化到长度 1
+            nn.AdaptiveAvgPool1d(1),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),  # [B, conv_channels]
+            nn.Linear(conv_channels, num_classes)
         )
 
     def forward(self, zs):
         # zs: [B, M, D]
-        B, M, D = zs.shape
-        zs_flat = zs.view(B, -1)  # Flatten all modalities [B, M*D]
-        return self.fusion_mlp(zs_flat)
+        x = zs.permute(0, 2, 1)  # -> [B, D, M]
+        x = self.conv(x)         # -> [B, conv_channels, 1]
+        return self.classifier(x)  # -> [B, num_classes]
+
 
 class MultiModalDataset(Dataset):
     def __init__(self, npz_path, modalities, indices=None):
@@ -160,11 +164,10 @@ def train(args):
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
         
         # Initialize model
-        model = MLPFusion(
+        model = Conv1dFusion(
             dim_latent=args.latent_dim,
             n_modalities=len(args.modalities),
             num_classes=args.num_classes,
-            hidden_dim=args.hidden_dim,
             dropout=args.dropout
         ).to(args.device)
         
@@ -210,11 +213,10 @@ def train(args):
         # Evaluate each fold's model on test set
         test_results = []
         for fold_res in fold_results:
-            model = MLPFusion(
+            model = Conv1dFusion(
                 dim_latent=args.latent_dim,
                 n_modalities=len(args.modalities),
                 num_classes=args.num_classes,
-                hidden_dim=args.hidden_dim,
                 dropout=args.dropout
             ).to(args.device)
             model.load_state_dict(torch.load(fold_res['model_path'],weights_only=True))
