@@ -115,26 +115,26 @@ def train_encoder(modality, data_tensor, args):
 
     print(f"[{modality}] Best @ epoch {best_epoch}, Val Loss={best_loss:.4f}")
 
-    # —— 画图并保存 —— 
-    epochs = list(range(1, args.epochs+1))
-    plt.figure(figsize=(6,4))
-    plt.plot(epochs, train_history, label="Train Loss")
-    plt.plot(epochs, val_history,   label="Val   Loss")
-    # 标注最低点
-    plt.scatter([best_epoch], [best_loss], color='red')
-    plt.text(best_epoch, best_loss,
-             f"  min={best_loss:.4f}\n  epoch={best_epoch}",
-             verticalalignment='bottom', fontsize=9)
-    plt.xlabel("Epoch"); plt.ylabel("MSE Loss")
-    plt.title(f"{modality} Autoencoder Loss Curves")
-    plt.grid(True); plt.legend()
-    save_path = os.path.join(
-        args.save_dir,
-        f"{modality}_{args.latent_dim}_epoch{args.epochs}_loss_curve.png"
-    )
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"[{modality}] Loss curves saved to {save_path}")
+    # # —— 画图并保存 —— 
+    # epochs = list(range(1, args.epochs+1))
+    # plt.figure(figsize=(6,4))
+    # plt.plot(epochs, train_history, label="Train Loss")
+    # plt.plot(epochs, val_history,   label="Val   Loss")
+    # # 标注最低点
+    # plt.scatter([best_epoch], [best_loss], color='red')
+    # plt.text(best_epoch, best_loss,
+    #          f"  min={best_loss:.4f}\n  epoch={best_epoch}",
+    #          verticalalignment='bottom', fontsize=9)
+    # plt.xlabel("Epoch"); plt.ylabel("MSE Loss")
+    # plt.title(f"{modality} Autoencoder Loss Curves")
+    # plt.grid(True); plt.legend()
+    # save_path = os.path.join(
+    #     args.save_dir,
+    #     f"{modality}_{args.latent_dim}_epoch{args.epochs}_loss_curve.png"
+    # )
+    # plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    # plt.close()
+    # print(f"[{modality}] Loss curves saved to {save_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -144,8 +144,8 @@ if __name__ == "__main__":
     parser.add_argument("--save_dir",  type=str, default="./pretrained")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epochs",     type=int, default=50)
-    parser.add_argument("--latent_dim", type=int, default=64)
-    parser.add_argument("--hidden_dim", type=int, default=128)
+    parser.add_argument("--latent_dim", type=int, default=256)
+    parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--lr",         type=float, default=1e-4)
     parser.add_argument("--device",     type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
