@@ -30,19 +30,19 @@ class ModalityMAE(nn.Module):
 
     def forward(self, x):
         # x: B×D_in
-        mask = self.random_mask(x)        # B×D_in，True 表示保留
-        x_masked = x * mask.float()
-        
-        # Encoder
-        z = self.encoder_embed(x_masked)  # B×D_latent
-        z = z.unsqueeze(1)                # B×1×D_latent
-        z = self.encoder(z)               # B×1×D_latent
-        z = z.squeeze(1)                  # B×D_latent
+        mask = self.random_mask(x)       # [B, D_in]
+        x_masked = x * mask.float()      # [B, D_in]
 
-        # Decoder 重建（注意：现在是在 latent 空间做 transformer）
-        z = z.unsqueeze(1)                # B×1×D_latent
-        z = self.decoder(z)               # B×1×D_latent
-        z = z.squeeze(1)                  # B×D_latent
-        x_rec = self.decoder_pred(z)      # B×D_in
+        # 把每个特征当 token：增加一个通道维
+        x_masked = x_masked.unsqueeze(-1)              # [B, D_in, 1]
+        z = self.encoder_embed(x_masked)               # [B, D_in, D_latent]
 
+        # Transformer 编码：每个 token 是一个特征
+        z = self.encoder(z)                            # [B, D_in, D_latent]
+
+        # Transformer 解码（可选）
+        z = self.decoder(z)                            # [B, D_in, D_latent]
+
+        # 预测每个特征
+        x_rec = self.decoder_pred(z).squeeze(-1)       # [B, D_in]
         return x_rec, mask
