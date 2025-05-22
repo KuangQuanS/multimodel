@@ -353,38 +353,6 @@ class GCSAM2D(nn.Module):
         x = self.spatial_attention(x)
         return x
 
-        
-class PSPModule(nn.Module):
-    def __init__(self, in_channels, pool_sizes=(1, 2, 3, 6), reduction=1):
-        super().__init__()
-        # 每一路池化后，用 1×1Conv 降维到 in_channels//reduction
-        out_channels = in_channels // reduction
-        self.stages = nn.ModuleList([
-            nn.Sequential(
-                nn.AdaptiveAvgPool2d(output_size=ps),
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(inplace=True)
-            ) for ps in pool_sizes
-        ])
-        # 最后汇总所有拼接回来的通道
-        self.bottleneck = nn.Sequential(
-            nn.Conv2d(in_channels + len(pool_sizes)*out_channels,
-                      in_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(in_channels),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, x):
-        h, w = x.size(2), x.size(3)
-        pyramids = [x]
-        for stage in self.stages:
-            out = stage(x)
-            pyramids.append(F.interpolate(out, size=(h, w), mode='bilinear', align_corners=False))
-        out = torch.cat(pyramids, dim=1)
-        return self.bottleneck(out)
-
-
 class Bottle2neck2D(nn.Module):
     expansion = 1
     def __init__(self, inplanes, planes, stride=1, baseWidth=26, scale=4, stype='normal'):
@@ -465,7 +433,10 @@ class Model(nn.Module):
         super().__init__()
         
         self.preBlock = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
@@ -475,21 +446,17 @@ class Model(nn.Module):
         )
         
         self.encoder = Encoder2D([128, 256, 512])
-        
-        #self.psp = PSPModule(in_channels=256, pool_sizes=(2,4), reduction=4)
-        
+
         self.gap = nn.Sequential(
-            nn.Conv2d(512, 256, kernel_size=1),
-            nn.AdaptiveAvgPool2d((1, 1)),
+            #nn.Conv2d(512, 256, kernel_size=1),
+            nn.AdaptiveAvgPool2d((2, 2)),
             nn.Flatten(),
-            nn.LayerNorm(256)
+            nn.LayerNorm(512*2*2)
         )
         
-        # 替代方式：去掉 Dropout，加 LayerNorm 或 BatchNorm
         self.mlp = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
+            nn.Linear(512*2*2, 128),
+            nn.Dropout(0.3),
             nn.Linear(128, num_classes)
         )
 
@@ -497,7 +464,6 @@ class Model(nn.Module):
         x = self.preBlock(x)
         x = self.encoder(x)
         x = self.gap(x)
-        #x = self.psp(x) 
         x = self.mlp(x)
         return x
         
@@ -508,7 +474,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
     parser.add_argument('--epochs', type=int, default=150, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--save_dir', type=str, default='./checkpoint/3slice/48', help='Directory to save checkpoints')
+    parser.add_argument('--save_dir', type=str, default='./resgsca_checkpoint/32', help='Directory to save checkpoints')
     parser.add_argument('--device', type=str, default=None, help='Device to use (cuda or cpu)')
     parser.add_argument('--cv', action='store_true', help='Use cross-validation')
     parser.add_argument('--folds', type=int, default=10, help='Number of folds for cross-validation')
