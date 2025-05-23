@@ -65,7 +65,7 @@ class Conv1dFusion(nn.Module):
             nn.Dropout(dropout),
 
             SEBlock1D(conv_channels),
-            
+
             # 池化到长度 1
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(), 
