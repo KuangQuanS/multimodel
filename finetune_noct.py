@@ -36,9 +36,20 @@ def load_encoder(mod, checkpoint_dir, latent_dim):
 
 class Conv1dFusion(nn.Module):
     def __init__(self, dim_latent, n_modalities, num_classes=2,
-                 conv_channels=64, dropout=0.3):
+                 conv_channels=512, dropout=0.3):
         super().__init__()
         # 在模态维上卷积：channels = dim_latent, 序列长度 = n_modalities
+        # self.conv = nn.Sequential(
+        #     nn.Conv1d(in_channels=dim_latent,
+        #               out_channels=conv_channels,
+        #               kernel_size=n_modalities,  # 一次性看全体模态
+        #               bias=False),
+        #     nn.BatchNorm1d(conv_channels),
+        #     nn.ReLU(inplace=True),
+        #     nn.Dropout(dropout),
+        #     # 池化到长度 1
+        #     nn.AdaptiveAvgPool1d(1),
+        # )
         self.conv = nn.Sequential(
             nn.Conv1d(in_channels=dim_latent,
                       out_channels=conv_channels,
@@ -49,10 +60,13 @@ class Conv1dFusion(nn.Module):
             nn.Dropout(dropout),
             # 池化到长度 1
             nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(), 
         )
         self.classifier = nn.Sequential(
-            nn.Flatten(),  # [B, conv_channels]
-            nn.Linear(conv_channels, num_classes)
+             # [B, conv_channels]
+            nn.Linear(conv_channels, 128),
+            nn.Dropout(dropout),
+            nn.Linear(128, num_classes)
         )
 
     def forward(self, zs):
