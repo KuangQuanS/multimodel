@@ -27,29 +27,34 @@ class ModalityEncoder(nn.Module):
 
 def load_encoder(mod, checkpoint_dir, latent_dim):
     """Load pretrained encoder"""
-    ckpt = torch.load(os.path.join(checkpoint_dir, f"{mod}_best.pth"),
+    ckpt = torch.load(os.path.join(checkpoint_dir, f"{mod}_encoder_best.pth"),
                      map_location="cpu", weights_only=True)
     dim_in = ckpt['0.weight'].shape[1]  # Get input dim from first layer weights
     encoder = ModalityEncoder(dim_in=dim_in, dim_latent=latent_dim)
     encoder.encoder.load_state_dict(ckpt)
     return encoder
 
+class SEBlock1D(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool1d(1)  # [B, C, L] -> [B, C, 1]
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, l = x.size()
+        y = self.pool(x).view(b, c)         # [B, C]
+        y = self.fc(y).view(b, c, 1)        # [B, C, 1]
+        return x * y.expand_as(x)           # [B, C, L]
+
 class Conv1dFusion(nn.Module):
     def __init__(self, dim_latent, n_modalities, num_classes=2,
                  conv_channels=512, dropout=0.3):
         super().__init__()
-        # 在模态维上卷积：channels = dim_latent, 序列长度 = n_modalities
-        # self.conv = nn.Sequential(
-        #     nn.Conv1d(in_channels=dim_latent,
-        #               out_channels=conv_channels,
-        #               kernel_size=n_modalities,  # 一次性看全体模态
-        #               bias=False),
-        #     nn.BatchNorm1d(conv_channels),
-        #     nn.ReLU(inplace=True),
-        #     nn.Dropout(dropout),
-        #     # 池化到长度 1
-        #     nn.AdaptiveAvgPool1d(1),
-        # )
         self.conv = nn.Sequential(
             nn.Conv1d(in_channels=dim_latent,
                       out_channels=conv_channels,
@@ -59,10 +64,13 @@ class Conv1dFusion(nn.Module):
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
 
+            SEBlock1D(conv_channels),
+            
             # 池化到长度 1
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(), 
         )
+
         self.classifier = nn.Sequential(
              # [B, conv_channels]
             nn.Linear(conv_channels, 128),
