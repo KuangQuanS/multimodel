@@ -53,11 +53,12 @@ class Conv1dFusion(nn.Module):
         self.conv = nn.Sequential(
             nn.Conv1d(in_channels=dim_latent,
                       out_channels=conv_channels,
-                      kernel_size=n_modalities,  # 一次性看全体模态
+                      kernel_size=min(3,n_modalities),
                       bias=False),
             nn.BatchNorm1d(conv_channels),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
+
             # 池化到长度 1
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(), 

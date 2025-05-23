@@ -3,14 +3,14 @@ import numpy as np
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import f1_score, roc_auc_score
-from model import FusionCrossAttn
+from model import ModalityMAE,FusionCrossAttn
 
 def finetune_crossattn(args):
     # 加载所有 modality 的 encoder
     encoders = []
     for mod in args.modalities:
         encoder = ModalityMAE(dim_in=0).encoder_embed  # 只占位，后面加载权重
-        state = torch.load(os.path.join(args.pretrain_dir, f"{mod}_encoder.pth"), map_location=args.device)
+        state = torch.load(os.path.join(args.pretrain_dir, f"{mod}_best_encoder.pth"), map_location=args.device)
         encoder = nn.Linear( args.latent_dim, args.latent_dim )  # placeholder
         encoder.load_state_dict(state)
         encoders.append(encoder.to(args.device))
