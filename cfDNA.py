@@ -9,8 +9,93 @@ from torch.utils.data import DataLoader,Dataset
 from sklearn.metrics import f1_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from model import ModalityEncoder,Conv1dFusion,CTModel
+from model import ModalityEncoder,Conv1dFusion
 
+# ----------------CfDNA模型-----------------
+class ModalityEncoder(nn.Module):
+    """Simplified encoder for single modality"""
+    def __init__(self, dim_in, dim_latent=256, hidden_dim=512):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(dim_in, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, dim_latent),
+            nn.BatchNorm1d(dim_latent)
+        )
+
+    def forward(self, x):
+        return self.encoder(x)
+
+class SEBlock1D(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool1d(1)  # [B, C, L] -> [B, C, 1]
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, l = x.size()
+        y = self.pool(x).view(b, c)         # [B, C]
+        y = self.fc(y).view(b, c, 1)        # [B, C, 1]  
+        return x * y.expand_as(x)           # [B, C, L]
+
+class Conv1dFusion(nn.Module):
+    def __init__(self, dim_latent, n_modalities, num_classes=2,
+                 conv_channels=512, dropout=0.3, train=True):
+        super().__init__()
+
+        self.training = train
+    
+        self.conv1 = nn.Sequential(
+            nn.Conv1d(in_channels=dim_latent,
+                      out_channels=conv_channels,
+                      kernel_size=min(3,n_modalities),
+                      bias=False),
+            nn.BatchNorm1d(conv_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            SEBlock1D(conv_channels),
+            # 池化到长度 1
+            #nn.AdaptiveAvgPool1d(1),
+            #nn.Flatten(), 
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv1d(in_channels=conv_channels,
+                      out_channels=conv_channels,
+                      kernel_size=min(3,n_modalities),
+                      bias=False),
+            nn.BatchNorm1d(conv_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            SEBlock1D(conv_channels),
+            # 池化到长度 1
+            #nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(), 
+        )
+        self.classifier = nn.Sequential(
+             # [B, conv_channels]
+            nn.Linear(conv_channels, 128),
+            nn.Dropout(dropout),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, zs):
+        # zs: [B, M, D]
+        if self.training:
+            noise = torch.randn_like(zs) * 0.01
+            zs = zs + noise
+        x = zs.permute(0, 2, 1)  # -> [B, D, M]
+        x = self.conv1(x)         # -> [B, conv_channels, 1]
+        x = self.conv2(x)
+
+        return self.classifier(x)  # -> [B, num_classes]
+    
 class MultiModalDataset(Dataset):
     def __init__(self, npz_path, modalities, indices=None):
         data = np.load(npz_path)
