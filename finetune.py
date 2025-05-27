@@ -506,9 +506,27 @@ def plot_roc_curve(labels, probs, output_dir, name):
     plt.savefig(os.path.join(output_dir, f'roc_curve_{name}.png'))
     plt.close()
 
-def run_single_fold(model, encoders, train_loader, val_loader, args, fold=None):
+def run_single_fold(model, encoders, train_loader, val_loader, args, fold=None, cv_dir=None):
     """运行单次训练和验证"""
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    if cv_dir is None:
+        cv_dir = os.path.join(args.output_dir, "cv_results")
+
+    # 根据finetune参数决定优化器参数
+    if args.finetune:
+        # 如果是微调模式，将所有可训练参数加入优化
+        params = []
+        # 添加融合模型参数
+        params.extend(model.parameters())
+        # 添加编码器参数
+        for encoder in encoders.values():
+            params.extend(encoder.parameters())
+        optimizer = optim.AdamW(params, lr=args.lr)
+        print("优化器包含融合模型和编码器参数")
+    else:
+        # 否则只优化融合模型参数
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+        print("优化器仅包含融合模型参数")
+
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs//3, eta_min=args.lr/10)
     criterion = nn.CrossEntropyLoss()
     
@@ -536,7 +554,7 @@ def run_single_fold(model, encoders, train_loader, val_loader, args, fold=None):
                 best_epoch = epoch
                 best_results = val_results
                 if fold is not None:
-                    model_path = os.path.join(args.output_dir, f"best_model_fold_{fold}.pth")
+                    model_path = os.path.join(cv_dir , f"best_model_fold_{fold}.pth")
                 else:
                     model_path = os.path.join(args.output_dir, "best_model.pth")
                 torch.save(model.state_dict(), model_path)
@@ -556,10 +574,15 @@ def run_cross_validation(args, dataset):
     # 加载预训练编码器
     encoders = {mod: load_encoder(mod, args.checkpoint_dir, args.latent_dim).to(args.device) 
                 for mod in args.modalities}
+    
+    # 设置编码器参数是否可更新
     for encoder in encoders.values():
-        encoder.eval()
-        for p in encoder.parameters():
-            p.requires_grad = False
+        if args.finetune:
+            encoder.train()
+        else:
+            encoder.eval()
+            for p in encoder.parameters():
+                p.requires_grad = False
     
     for fold, (train_idx, val_idx) in enumerate(kf.split(dataset), 1):
         print(f"\n{'='*20} Fold {fold}/{args.k_folds} {'='*20}")
@@ -581,7 +604,7 @@ def run_cross_validation(args, dataset):
         
         # 训练和验证
         fold_results, best_epoch = run_single_fold(
-            model, encoders, train_loader, val_loader, args, fold
+            model, encoders, train_loader, val_loader, args, fold, cv_dir
         )
         
         # 保存结果
@@ -661,8 +684,10 @@ def main():
     parser.add_argument("--eval_interval", type=int, default=10)
     parser.add_argument("--eval_only", action="store_true", help="仅进行评估，不训练模型")
     parser.add_argument("--model_path", type=str, default=None, help="用于评估的模型路径")
+    parser.add_argument("--ct_model_path", type=str, default=None, help="CT模型预训练参数路径")
     parser.add_argument("--cross_val", action="store_true", help="执行交叉验证")
     parser.add_argument("--k_folds", type=int, default=10, help="交叉验证的折数")
+    parser.add_argument("--finetune", action="store_true", help="允许更新encoder和CT模型参数")
     parser.add_argument("--device", type=str, 
                     default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -778,10 +803,16 @@ def main():
     # 加载预训练编码器
     encoders = {mod: load_encoder(mod, args.checkpoint_dir, args.latent_dim).to(args.device) 
                 for mod in args.modalities}
+    
+    # 设置编码器参数是否可更新
     for encoder in encoders.values():
-        encoder.eval()
-        for p in encoder.parameters():
-            p.requires_grad = False
+        if args.finetune:
+            encoder.train()
+            print(f"设置编码器为微调模式，参数可更新")
+        else:
+            encoder.eval()
+            for p in encoder.parameters():
+                p.requires_grad = False
     
     # 初始化模型
     model = CrossAttentionFusion(
@@ -791,6 +822,37 @@ def main():
         dropout=0.3,
         train=True
     ).to(args.device)
+    
+    # 加载CT模型预训练参数（如果提供）
+    if 'ct' in args.modalities and args.ct_model_path:
+        print(f"加载CT模型预训练参数: {args.ct_model_path}")
+        # 获取CT模型
+        ct_model = None
+        for mod, encoder in encoders.items():
+            if mod == 'ct':
+                ct_model = encoder
+                break
+        
+        if ct_model:
+            # 加载预训练参数
+            pretrained_state_dict = torch.load(args.ct_model_path, map_location=args.device)
+            
+            # 过滤掉不匹配的参数
+            model_state_dict = ct_model.state_dict()
+            filtered_state_dict = {k: v for k, v in pretrained_state_dict.items() 
+                                  if k in model_state_dict and v.shape == model_state_dict[k].shape}
+            
+            # 加载匹配的参数
+            ct_model.load_state_dict(filtered_state_dict, strict=False)
+            
+            # 设置CT模型参数是否可更新
+            if args.finetune:
+                ct_model.train()
+                print(f"设置CT模型为微调模式，参数可更新")
+            else:
+                ct_model.eval()
+                for p in ct_model.parameters():
+                    p.requires_grad = False
     
     # 如果有独立测试集，使用验证集进行训练
     if args.test_file:
