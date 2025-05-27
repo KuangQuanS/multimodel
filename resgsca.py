@@ -233,17 +233,17 @@ class CTModel(nn.Module):
             #nn.MaxPool2d(kernel_size=2, stride=2)
         )
         
-        self.encoder = Encoder2D([128, 256, 512])
+        self.encoder = Encoder2D([128, 256, 256])
 
         self.gap = nn.Sequential(
             #nn.Conv2d(512, 256, kernel_size=1),
-            nn.AdaptiveAvgPool2d((2, 2)),
+            nn.AdaptiveAvgPool2d((5, 5)),
             nn.Flatten(),
-            nn.LayerNorm(512*2*2)
+            nn.LayerNorm(256*5*5)
         )
         
         self.mlp = nn.Sequential(
-            nn.Linear(512*2*2, 128),
+            nn.Linear(256*5*5, 128),
             nn.Dropout(0.3),
             nn.Linear(128, num_classes)
         )
