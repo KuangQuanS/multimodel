@@ -258,52 +258,41 @@ class CTModel(nn.Module):
 
 class CrossAttentionFusion(nn.Module):
     def __init__(self, dim_latent, n_modalities, num_classes=2, 
-                 conv_channels=512, dropout=0.3, train=True):
+                 conv_channels=512, d_model=128, n_heads=4, dropout=0.3, train=True):
         super().__init__()
         self.training = train
         
-        # CfDNA特征处理部分
-        self.cfdna_conv1 = nn.Sequential(
-            nn.Conv1d(in_channels=dim_latent,
-                      out_channels=conv_channels,
-                      kernel_size=min(3, n_modalities),
-                      bias=False),
+        # CfDNA特征处理，conv_channels可调，保留原设计
+        self.cfdna_conv = nn.Sequential(
+            nn.Conv1d(in_channels=dim_latent, out_channels=conv_channels,
+                      kernel_size=min(3, n_modalities), bias=False),
             nn.BatchNorm1d(conv_channels),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             SEBlock1D(conv_channels),
         )
         
-        self.cfdna_conv2 = nn.Sequential(
-            nn.Conv1d(in_channels=conv_channels,
-                      out_channels=conv_channels,
-                      kernel_size=min(3, n_modalities),
-                      bias=False),
-            nn.BatchNorm1d(conv_channels),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            SEBlock1D(conv_channels),
-            nn.Flatten(),
-        )
+        # 把conv输出做通道降维，准备做attention token表示
+        self.token_proj = nn.Linear(conv_channels, d_model)
         
         # CT模型
         self.ct_model = CTModel(in_channels=3, num_classes=num_classes)
-        
-        # 提取CT特征的层
         self.ct_feature_extractor = nn.Sequential(
             self.ct_model.preBlock,
             self.ct_model.encoder,
             self.ct_model.gap
         )
         
-        # 交叉注意力机制
-        self.cfdna_query = nn.Linear(conv_channels, 256)
-        self.ct_key = nn.Linear(512*2*2, 256)
-        self.ct_value = nn.Linear(512*2*2, 256)
+        # 将CT特征映射到d_model维度，作为Key和Value输入
+        self.ct_proj_k = nn.Linear(512*2*2, d_model)
+        self.ct_proj_v = nn.Linear(512*2*2, d_model)
         
-        # 特征融合
+        # Multi-head Attention，query来自cfdna token，key/value来自ct特征
+        self.multihead_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, dropout=dropout, batch_first=True)
+        
+        # 融合层，输入维度 d_model * 2，因为concat了attention输出和cfdna token的平均
         self.fusion_layer = nn.Sequential(
-            nn.Linear(conv_channels + 256, 256),
+            nn.Linear(d_model * 2, 256),
             nn.LayerNorm(256),
             nn.ReLU(),
             nn.Dropout(dropout)
@@ -315,41 +304,42 @@ class CrossAttentionFusion(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(128, num_classes)
         )
-
+        
     def forward(self, zs, ct_images=None):
-        # 处理cfdna特征
+        # zs shape [B, D, M], D=dim_latent, M=n_modalities
+        
         if self.training:
             noise = torch.randn_like(zs) * 0.01
             zs = zs + noise
-            
-        x = zs.permute(0, 2, 1)  # -> [B, D, M]
-        x = self.cfdna_conv1(x)   # -> [B, conv_channels, M']
-        cfdna_features = self.cfdna_conv2(x)  # -> [B, conv_channels]
         
-        # 如果没有CT图像，只使用cfdna特征
+        x = zs # [B, M, D]
+        x = self.cfdna_conv(x.permute(0, 2, 1))  # conv1d expects [B, D, M], 输出 [B, conv_channels, M']
+        x = x.permute(0, 2, 1)  # [B, M', conv_channels]
+        
+        # token表示，每个模态一个token
+        tokens = self.token_proj(x)  # [B, M', d_model]
+        
         if ct_images is None:
-            return self.classifier(self.fusion_layer(cfdna_features))
+            # 没有CT图，平均池化token后分类
+            pooled = tokens.mean(dim=1)
+            fused = self.fusion_layer(torch.cat([pooled, pooled], dim=1))  # concat自己两遍凑维度
+            logits = self.classifier(fused)
+            return logits
         
-        # 处理CT特征 [B, 3, 64, 64]
-        ct_features = self.ct_feature_extractor(ct_images)  # [B, 512*2*2]
+        # CT特征提取
+        ct_feat = self.ct_feature_extractor(ct_images)  # [B, 512*2*2]
+        k = self.ct_proj_k(ct_feat).unsqueeze(1)  # [B, 1, d_model]
+        v = self.ct_proj_v(ct_feat).unsqueeze(1)  # [B, 1, d_model]
         
-        # 交叉注意力
-        query = self.cfdna_query(cfdna_features).unsqueeze(1)  # [B, 1, 256]
-        key = self.ct_key(ct_features).unsqueeze(1)  # [B, 1, 256]
-        value = self.ct_value(ct_features).unsqueeze(1)  # [B, 1, 256]
+        # Cross attention，query是cfdna tokens，key,value是CT特征
+        attn_output, attn_weights = self.multihead_attn(query=tokens, key=k, value=v)
         
-        # 计算注意力权重
-        attention_scores = torch.matmul(query, key.transpose(-2, -1)) / (256 ** 0.5)
-        attention_weights = torch.softmax(attention_scores, dim=-1)
+        # 平均池化token作为cfdna全局信息
+        pooled = tokens.mean(dim=1)
+        # 平均池化attention输出作为融合信息
+        attn_pooled = attn_output.mean(dim=1)
         
-        # 加权CT特征
-        ct_context = torch.matmul(attention_weights, value).squeeze(1)  # [B, 256]
-        
-        # 特征融合
-        combined_features = torch.cat([cfdna_features, ct_context], dim=1)
-        fused = self.fusion_layer(combined_features)
-        
-        # 分类
+        fused = self.fusion_layer(torch.cat([pooled, attn_pooled], dim=1))
         logits = self.classifier(fused)
         
         return logits
