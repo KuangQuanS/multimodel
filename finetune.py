@@ -140,45 +140,6 @@ class Encoder2D(nn.Module):
             x = block(x)
         return x
 
-class CTModel(nn.Module):
-    def __init__(self, num_classes=2):
-        super().__init__()
-        
-        self.preBlock = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            #nn.MaxPool2d(kernel_size=2, stride=2)
-        )
-        
-        self.encoder = Encoder2D([128, 256, 512])
-
-        self.gap = nn.Sequential(
-            #nn.Conv2d(512, 256, kernel_size=1),
-            nn.AdaptiveAvgPool2d((2, 2)),
-            nn.Flatten(),
-            nn.LayerNorm(512*2*2)
-        )
-        
-        self.mlp = nn.Sequential(
-            nn.Linear(512*2*2, 128),
-            nn.Dropout(0.3),
-            nn.Linear(128, num_classes)
-        )
-
-    def forward(self, x):
-        x = self.preBlock(x)
-        x = self.encoder(x)
-        x = self.gap(x)
-        x = self.mlp(x)
-        return x
-
 class MultiModalDataset(Dataset):
     def __init__(self, npz_path, modalities, indices=None, include_ct=False):
         data = np.load(npz_path)
@@ -648,10 +609,24 @@ def run_cross_validation(args, dataset):
     ])
     
     # 保存详细结果
+    # 确保所有NumPy类型都转换为Python原生类型
+    processed_results = []
+    for r in all_results:
+        processed_result = {
+            'fold': int(r['fold']),
+            'f1': float(r['f1']),
+            'auc': float(r['auc']),
+            'best_epoch': int(r['best_epoch']),
+            'preds': [int(p) for p in r['preds']],
+            'probs': [float(p) for p in r['probs']],
+            'labels': [int(l) for l in r['labels']]
+        }
+        processed_results.append(processed_result)
+    
     results_dict = {
         'timestamp': timestamp,
         'args': vars(args),
-        'fold_results': all_results,
+        'fold_results': processed_results,
         'summary': {
             'mean_f1': float(mean_f1),
             'std_f1': float(std_f1),
@@ -786,13 +761,18 @@ def main():
         )
         
         # 保存结果
+        processed_results = {
+            'f1': float(test_results['f1']),
+            'auc': float(test_results['auc']),
+            'preds': [int(p) for p in test_results['preds']],
+            'probs': [float(p) for p in test_results['probs']],
+            'labels': [int(l) for l in test_results['labels']]
+        }
+        
         results_dict = {
             'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
             'args': vars(args),
-            'metrics': {
-                'f1': float(test_results['f1']),
-                'auc': float(test_results['auc'])
-            }
+            'metrics': processed_results
         }
         with open(os.path.join(args.output_dir, 'eval_results.json'), 'w') as f:
             json.dump(results_dict, f, indent=2)
@@ -885,18 +865,28 @@ def main():
         )
         
         # 保存结果
+        processed_val_results = {
+            'f1': float(best_results['f1']),
+            'auc': float(best_results['auc']),
+            'preds': [int(p) for p in best_results['preds']],
+            'probs': [float(p) for p in best_results['probs']],
+            'labels': [int(l) for l in best_results['labels']]
+        }
+        
+        processed_test_results = {
+            'f1': float(test_results['f1']),
+            'auc': float(test_results['auc']),
+            'preds': [int(p) for p in test_results['preds']],
+            'probs': [float(p) for p in test_results['probs']],
+            'labels': [int(l) for l in test_results['labels']]
+        }
+        
         results_dict = {
             'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
             'args': vars(args),
-            'best_epoch': best_epoch,
-            'validation': {
-                'f1': float(best_results['f1']),
-                'auc': float(best_results['auc'])
-            },
-            'test': {
-                'f1': float(test_results['f1']),
-                'auc': float(test_results['auc'])
-            }
+            'best_epoch': int(best_epoch),
+            'validation': processed_val_results,
+            'test': processed_test_results
         }
         with open(os.path.join(args.output_dir, 'train_results.json'), 'w') as f:
             json.dump(results_dict, f, indent=2)
@@ -927,14 +917,19 @@ def main():
         )
         
         # 保存结果
+        processed_results = {
+            'f1': float(best_results['f1']),
+            'auc': float(best_results['auc']),
+            'preds': [int(p) for p in best_results['preds']],
+            'probs': [float(p) for p in best_results['probs']],
+            'labels': [int(l) for l in best_results['labels']]
+        }
+        
         results_dict = {
             'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
             'args': vars(args),
-            'best_epoch': best_epoch,
-            'metrics': {
-                'f1': float(best_results['f1']),
-                'auc': float(best_results['auc'])
-            }
+            'best_epoch': int(best_epoch),
+            'metrics': processed_results
         }
         with open(os.path.join(args.output_dir, 'train_results.json'), 'w') as f:
             json.dump(results_dict, f, indent=2)
