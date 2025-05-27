@@ -237,13 +237,13 @@ class CTModel(nn.Module):
 
         self.gap = nn.Sequential(
             #nn.Conv2d(512, 256, kernel_size=1),
-            nn.AdaptiveAvgPool2d((5, 5)),
+            nn.AdaptiveAvgPool2d((8, 8)),
             nn.Flatten(),
-            nn.LayerNorm(256*5*5)
+            nn.LayerNorm(256*8*8)
         )
         
         self.mlp = nn.Sequential(
-            nn.Linear(256*5*5, 128),
+            nn.Linear(256*8*8, 128),
             nn.Dropout(0.3),
             nn.Linear(128, num_classes)
         )
