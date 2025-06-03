@@ -250,7 +250,7 @@ class CTModel(nn.Module):
 
 class CrossAttentionFusion(nn.Module):
     def __init__(self, dim_latent, n_modalities, num_classes=2, 
-                 conv_channels=512, d_model=128, n_heads=4, dropout=0.3, train=True):
+                 conv_channels=512, d_model=768, n_heads=4, dropout=0.3, train=True):
         super().__init__()
         self.training = train
         
@@ -280,8 +280,9 @@ class CrossAttentionFusion(nn.Module):
         self.ct_proj_v = nn.Linear(256*8*8, d_model)
         
         # Multi-head Attention，query来自cfdna token，key/value来自ct特征
-        self.multihead_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, dropout=dropout, batch_first=True)
-        
+        # self.multihead_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, dropout=dropout, batch_first=True)
+        self.multihead_attn_cf_to_ct = nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, dropout=dropout, batch_first=True)
+        self.multihead_attn_ct_to_cf = nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, dropout=dropout, batch_first=True)
         # 融合层，输入维度 d_model * 2，因为concat了attention输出和cfdna token的平均
         self.fusion_layer = nn.Sequential(
             nn.Linear(d_model * 2, 256),
@@ -298,42 +299,47 @@ class CrossAttentionFusion(nn.Module):
         )
         
     def forward(self, zs, ct_images=None):
-        # zs shape [B, D, M], D=dim_latent, M=n_modalities
-        
+        # zs shape [B, D, M]，M=模态数量
+
         if self.training:
             noise = torch.randn_like(zs) * 0.01
             zs = zs + noise
-        
-        x = zs # [B, M, D]
-        x = self.cfdna_conv(x.permute(0, 2, 1))  # conv1d expects [B, D, M], 输出 [B, conv_channels, M']
-        x = x.permute(0, 2, 1)  # [B, M', conv_channels]
-        
-        # token表示，每个模态一个token
-        tokens = self.token_proj(x)  # [B, M', d_model]
-        
+
+        # --- cfDNA 特征提取 ---
+        x = zs  # [B, D, M]
+        x = self.cfdna_conv(x.permute(0, 2, 1))  # -> [B, conv_channels, M']
+        x = x.permute(0, 2, 1)  # -> [B, M', conv_channels]
+
+        cfdna_tokens = self.token_proj(x)  # -> [B, M', d_model]
+
         if ct_images is None:
-            # 没有CT图，平均池化token后分类
-            pooled = tokens.mean(dim=1)
-            fused = self.fusion_layer(torch.cat([pooled, pooled], dim=1))  # concat自己两遍凑维度
+            pooled = cfdna_tokens.mean(dim=1)
+            fused = self.fusion_layer(torch.cat([pooled, pooled], dim=1))
             logits = self.classifier(fused)
             return logits
-        
-        # CT特征提取
+
+        # --- CT 特征提取 ---
         ct_feat = self.ct_feature_extractor(ct_images)  # [B, 512*2*2]
-        k = self.ct_proj_k(ct_feat).unsqueeze(1)  # [B, 1, d_model]
-        v = self.ct_proj_v(ct_feat).unsqueeze(1)  # [B, 1, d_model]
-        
-        # Cross attention，query是cfdna tokens，key,value是CT特征
-        attn_output, attn_weights = self.multihead_attn(query=tokens, key=k, value=v)
-        
-        # 平均池化token作为cfdna全局信息
-        pooled = tokens.mean(dim=1)
-        # 平均池化attention输出作为融合信息
-        attn_pooled = attn_output.mean(dim=1)
-        
-        fused = self.fusion_layer(torch.cat([pooled, attn_pooled], dim=1))
+        ct_feat_proj = self.ct_proj_v(ct_feat)  # [B, d_model]
+
+        # reshape为 [B, 1, d_model] 用作 cross-attn 的输入
+        k_ct = self.ct_proj_k(ct_feat).unsqueeze(1)  # [B, 1, d_model]
+        v_ct = self.ct_proj_v(ct_feat).unsqueeze(1)  # [B, 1, d_model]
+
+        # === 第一次 Cross-Attention（cfDNA -> CT）===
+        attn_cf_to_ct, _ = self.multihead_attn_cf_to_ct(query=cfdna_tokens, key=k_ct, value=v_ct)
+        attn_cf_to_ct_pooled = attn_cf_to_ct.mean(dim=1)  # [B, d_model]
+
+        # === 第二次 Cross-Attention（CT -> cfDNA）===
+        # 将 ct_feat 作为 query，cfDNA tokens 为 key/value
+        q_ct = ct_feat_proj.unsqueeze(1)  # [B, 1, d_model]
+        attn_ct_to_cf, _ = self.multihead_attn_ct_to_cf(query=q_ct, key=cfdna_tokens, value=cfdna_tokens)
+        attn_ct_to_cf_pooled = attn_ct_to_cf.squeeze(1)  # [B, d_model]
+
+        # --- 融合 ---
+        fused = self.fusion_layer(torch.cat([attn_cf_to_ct_pooled, attn_ct_to_cf_pooled], dim=1))  # [B, d_model*2]
         logits = self.classifier(fused)
-        
+
         return logits
 
 def load_encoder(mod, checkpoint_dir, latent_dim):
@@ -359,7 +365,6 @@ def train_epoch(model, encoders, loader, optimizer, criterion, device):
         
         # 将所有模态特征堆叠在一起
         zs = torch.stack(modality_features, dim=1)  # [B, M, D]
-        
         # 处理CT数据
         ct_data = batch.get('CT')
         if ct_data is not None:
@@ -472,7 +477,6 @@ def run_single_fold(model, encoders, train_loader, val_loader, args, fold=None, 
 
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs//3, eta_min=args.lr/10)
     criterion = nn.CrossEntropyLoss()
-    
     best_auc = 0
     best_epoch = 0
     best_results = None
@@ -699,11 +703,7 @@ def main():
     # 加载预训练编码器
     encoders = {mod: load_encoder(mod, args.checkpoint_dir, args.latent_dim).to(args.device) 
                 for mod in args.modalities}
-    for encoder in encoders.values():
-        encoder.eval()
-        for p in encoder.parameters():
-            p.requires_grad = False
-
+    
     # 初始化模型
     model = CrossAttentionFusion(
         dim_latent=args.latent_dim,
@@ -761,11 +761,6 @@ def main():
             
         return
 
-    # 训练模式 - 使用run_single_fold函数进行训练
-    # 加载预训练编码器
-    encoders = {mod: load_encoder(mod, args.checkpoint_dir, args.latent_dim).to(args.device) 
-                for mod in args.modalities}
-    
     # 设置编码器参数是否可更新
     for encoder in encoders.values():
         if args.finetune:
@@ -775,15 +770,6 @@ def main():
             encoder.eval()
             for p in encoder.parameters():
                 p.requires_grad = False
-    
-    # 初始化模型
-    model = CrossAttentionFusion(
-        dim_latent=args.latent_dim,
-        n_modalities=len(args.modalities),
-        num_classes=2,
-        dropout=0.3,
-        train=True
-    ).to(args.device)
     
     # 加载CT模型预训练参数（如果提供）
     if 'ct' in args.modalities and args.ct_model_path:
