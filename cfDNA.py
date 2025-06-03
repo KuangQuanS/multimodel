@@ -9,7 +9,6 @@ from torch.utils.data import DataLoader,Dataset
 from sklearn.metrics import f1_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from model import ModalityEncoder,Conv1dFusion
 
 # ----------------CfDNA模型-----------------
 class ModalityEncoder(nn.Module):

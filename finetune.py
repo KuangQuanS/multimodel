@@ -226,25 +226,17 @@ class CTModel(nn.Module):
             nn.ReLU(inplace=True),
         )
         
-        self.encoder = nn.Sequential(
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-            nn.Conv2d(256, 512, kernel_size=3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2)
-        )
+        self.encoder = Encoder2D([128, 256, 256])
 
         self.gap = nn.Sequential(
-            nn.AdaptiveAvgPool2d((2, 2)),
+            #nn.Conv2d(512, 256, kernel_size=1),
+            nn.AdaptiveAvgPool2d((8, 8)),
             nn.Flatten(),
-            nn.LayerNorm(512*2*2)
+            nn.LayerNorm(256*8*8)
         )
         
         self.mlp = nn.Sequential(
-            nn.Linear(512*2*2, 128),
+            nn.Linear(256*8*8, 128),
             nn.Dropout(0.3),
             nn.Linear(128, num_classes)
         )
@@ -284,8 +276,8 @@ class CrossAttentionFusion(nn.Module):
         )
         
         # 将CT特征映射到d_model维度，作为Key和Value输入
-        self.ct_proj_k = nn.Linear(512*2*2, d_model)
-        self.ct_proj_v = nn.Linear(512*2*2, d_model)
+        self.ct_proj_k = nn.Linear(256*8*8, d_model)
+        self.ct_proj_v = nn.Linear(256*8*8, d_model)
         
         # Multi-head Attention，query来自cfdna token，key/value来自ct特征
         self.multihead_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, dropout=dropout, batch_first=True)
