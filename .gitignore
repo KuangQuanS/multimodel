@@ -1,0 +1,5 @@
+results/
+cfDNA/cancer_and_benign_pretrained/
+CT/swin_checkpoint/
+CT/cv_checkpoints/
+visualization/
