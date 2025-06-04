@@ -546,7 +546,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
     parser.add_argument('--epochs', type=int, default=150, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--save_dir', type=str, default='./resgsca_checkpoint/32', help='Directory to save checkpoints')
+    parser.add_argument('--save_dir', type=str, default='./resgsca_checkpoint/', help='Directory to save checkpoints')
     parser.add_argument('--device', type=str, default=None, help='Device to use (cuda or cpu)')
     parser.add_argument('--cv', action='store_true', help='Use cross-validation')
     parser.add_argument('--folds', type=int, default=10, help='Number of folds for cross-validation')
