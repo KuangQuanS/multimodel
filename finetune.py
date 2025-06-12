@@ -199,13 +199,22 @@ class ModalityEncoder(nn.Module):
             nn.Linear(dim_in, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, dim_latent),
-            nn.BatchNorm1d(dim_latent)
+            nn.Dropout(0.2)
         )
+        self.fc_mu = nn.Linear(hidden_dim, dim_latent)
+        self.fc_logvar = nn.Linear(hidden_dim, dim_latent)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
 
     def forward(self, x):
-        return self.encoder(x)
+        h = self.encoder(x)
+        mu = self.fc_mu(h)
+        logvar = self.fc_logvar(h)
+        z = self.reparameterize(mu, logvar)
+        return z
 
 class CrossAttentionFusion(nn.Module):
     def __init__(self, dim_latent, n_modalities, num_classes=2, 

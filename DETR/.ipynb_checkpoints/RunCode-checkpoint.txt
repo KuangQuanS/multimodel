@@ -1,0 +1,20 @@
+torchrun --nproc_per_node=2 main.py \
+  --log_dir ./RunLog \
+  --output_dir ./checkpoint \
+  --with_box_refine \
+  --two_stage \
+  --coco_path ./datadir \
+  --num_classes 2 \
+  --batch_size 4 \
+  --epochs 160 \
+  --focal_alpha 0.25 \
+  --lr_drop 120 
+
+python main.py \
+  --output_dir ./RunLog \
+  --with_box_refine \
+  --two_stage \
+  --coco_path ./datadir \
+  --num_classes 2 \
+  --batch_size 6 \
+  --epochs 200

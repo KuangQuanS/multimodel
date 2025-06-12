@@ -17,11 +17,12 @@ class ModalityEncoder(nn.Module):
             nn.Linear(dim_in, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, dim_latent),
-            nn.BatchNorm1d(dim_latent)
+            nn.Dropout(0.2)
         )
-        
+
+        self.fc_mu = nn.Linear(hidden_dim, dim_latent)
+        self.fc_logvar = nn.Linear(hidden_dim, dim_latent)
+
         # 解码器
         self.decoder = nn.Sequential(
             nn.Linear(dim_latent, hidden_dim),
@@ -30,10 +31,17 @@ class ModalityEncoder(nn.Module):
             nn.Dropout(0.2),
             nn.Linear(hidden_dim, dim_in)
         )
-
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)  # 取 exp(logvar / 2)
+        eps = torch.randn_like(std)   # 与 std 相同形状的标准正态噪声
+        return mu + eps * std
+    
     def forward(self, x):
         # 编码
-        z = self.encoder(x)  # B×D_latent
+        h = self.encoder(x)  # B×D_latent
+        mu = self.fc_mu(h)               # B×latent
+        logvar = self.fc_logvar(h)       # B×latent
+        z = self.reparameterize(mu, logvar)  # B×latent
         # 解码
         x_rec = self.decoder(z)  # B×D_in
         return x_rec, z

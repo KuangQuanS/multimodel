@@ -4,3 +4,9 @@ CT/swin_checkpoint/
 CT/cv_checkpoints/
 visualization/
 __pycache__/
+DETR/datadir/
+DETR/database/
+DETR/RunLog/
+DETR/checkpoint/
+cancer_benign_results/
+subtype_results/

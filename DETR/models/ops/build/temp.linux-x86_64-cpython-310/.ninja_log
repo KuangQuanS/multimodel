@@ -1,0 +1,4 @@
+# ninja log v6
+30	11546	1746321514992199100	/mnt/d/modules/DETR/models/ops/build/temp.linux-x86_64-cpython-310/mnt/d/modules/DETR/models/ops/src/cpu/ms_deform_attn_cpu.o	80f725d3a25654f1
+53	25517	1746321515019322100	/mnt/d/modules/DETR/models/ops/build/temp.linux-x86_64-cpython-310/mnt/d/modules/DETR/models/ops/src/vision.o	315822f31ef22107
+40	31672	1746321515004349800	/mnt/d/modules/DETR/models/ops/build/temp.linux-x86_64-cpython-310/mnt/d/modules/DETR/models/ops/src/cuda/ms_deform_attn_cuda.o	a25b6691829bf950
