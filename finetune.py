@@ -217,7 +217,7 @@ class ModalityEncoder(nn.Module):
 
 class CrossAttentionFusion(nn.Module):
     def __init__(self, dim_latent, n_modalities, num_classes=2, 
-                 conv_channels=512, d_model=768, n_heads=4, dropout=0.3, train=True):
+                 conv_channels=512, d_model=768, n_heads=4, dropout=0.3, train=True, ct_feature_extractor=None, finetune_ct=True):
         super().__init__()
         self.training = train
         
@@ -232,12 +232,14 @@ class CrossAttentionFusion(nn.Module):
         self.token_proj = nn.Linear(conv_channels, d_model)
         
         # CT model components
-        self.ct_model = CTModel(in_channels=3, num_classes=num_classes)
-        self.ct_feature_extractor = nn.Sequential(
-            self.ct_model.preBlock,
-            self.ct_model.encoder,
-            self.ct_model.gap
-        )
+        assert ct_feature_extractor is not None, "ct_feature_extractor must be provided"
+        self.ct_feature_extractor = ct_feature_extractor
+
+        if not finetune_ct:
+            for p in self.ct_feature_extractor.parameters():
+                p.requires_grad = False
+            self.ct_feature_extractor.eval()  # 不启用 BN/Dropout 的训练行为
+
         self.ct_proj_k = nn.Linear(256*8*8, d_model)
         self.ct_proj_v = nn.Linear(256*8*8, d_model)
         
@@ -308,7 +310,7 @@ class MultiModalDataset(Dataset):
             if self.ct_data is not None:
                 self.ct_data = self.ct_data[indices]
             if self.id is not None:
-                self.id = self.id[indices]  # 👈 这行很关键
+                self.id = self.id[indices]
 
     def __len__(self):
         return len(self.y)
@@ -480,10 +482,18 @@ def run_cross_validation(args, dataset):
             encoder.eval()
             for p in encoder.parameters():
                 p.requires_grad = False
+    
+    ct_model = CTModel(in_channels=3, num_classes=2)
+    ct_model.load_state_dict(torch.load(args.ct_model_path, map_location=args.device))
+    ct_model = ct_model.to(args.device)
+    ct_feature_extractor = nn.Sequential(
+        ct_model.preBlock,
+        ct_model.encoder,
+        ct_model.gap
+    ).to(args.device)
 
     all_results = []
     
-    # ✅ 修改这一行，传入 dataset.y 做分层
     for fold, (train_idx, val_idx) in enumerate(kf.split(dataset, dataset.y), 1):
         print(f"\n{'='*20} Fold {fold}/{args.k_folds} {'='*20}")
         
@@ -497,7 +507,9 @@ def run_cross_validation(args, dataset):
             n_modalities=len(args.modalities),
             num_classes=2,
             dropout=0.3,
-            train=True
+            train=True,
+            ct_feature_extractor=ct_feature_extractor,
+            finetune_ct=False
         ).to(args.device)
         
         fold_results, best_epoch = run_single_fold(
@@ -619,14 +631,23 @@ def main():
     # Load encoders
     encoders = {mod: load_encoder(mod, args.checkpoint_dir, args.latent_dim).to(args.device) 
                for mod in args.modalities}
-    
+    ct_model = CTModel(in_channels=3, num_classes=2)
+    ct_model.load_state_dict(torch.load(args.ct_model_path, map_location=args.device))
+    ct_model = ct_model.to(args.device)
+    ct_feature_extractor = nn.Sequential(
+        ct_model.preBlock,
+        ct_model.encoder,
+        ct_model.gap
+    ).to(args.device)
     # Initialize model
     model = CrossAttentionFusion(
         dim_latent=args.latent_dim,
         n_modalities=len(args.modalities),
         num_classes=2,
         dropout=0.3,
-        train=not args.eval_only
+        train=not args.eval_only,
+        ct_feature_extractor=ct_feature_extractor,
+        finetune_ct=False
     ).to(args.device)
 
     # Evaluation only mode
