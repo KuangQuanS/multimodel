@@ -83,7 +83,7 @@ class FocalLoss(nn.Module):
         else:
             return loss
         
-class ChannelAttention2D(nn.Module):
+class ChannelAttention(nn.Module):
     def __init__(self, inplanes, reduction=16):
         super().__init__()
         self.conv_mask = nn.Conv2d(inplanes, 1, kernel_size=1)
@@ -110,7 +110,7 @@ class ChannelAttention2D(nn.Module):
         channel_mul_term = self.sigmoid(self.channel_mul_conv(context))
         return x * channel_mul_term
 
-class SpatialAttention2D(nn.Module):
+class SpatialAttention(nn.Module):
     def __init__(self, kernel_size=7):
         super().__init__()
         padding = 3 if kernel_size == 7 else 1
@@ -123,18 +123,18 @@ class SpatialAttention2D(nn.Module):
         x_cat = torch.cat([max_out, avg_out], dim=1)
         return x * self.sigmoid(self.conv1(x_cat))
 
-class GCSAM2D(nn.Module):
+class CBAM(nn.Module):
     def __init__(self, in_channels, reduction=16):
         super().__init__()
-        self.channel_attention = ChannelAttention2D(in_channels, reduction)
-        self.spatial_attention = SpatialAttention2D()
+        self.channel_attention = ChannelAttention(in_channels, reduction)
+        self.spatial_attention = SpatialAttention()
 
     def forward(self, x):
         x = self.channel_attention(x)
         x = self.spatial_attention(x)
         return x
 
-class Bottle2neck2D(nn.Module):
+class Res2Block(nn.Module):
     expansion = 1
     def __init__(self, inplanes, planes, stride=1, baseWidth=26, scale=4, stype='normal'):
         super().__init__()
@@ -169,7 +169,7 @@ class Bottle2neck2D(nn.Module):
         else:
             self.shortcut = nn.Identity()
 
-        self.GCS = GCSAM2D(planes)
+        self.GCS = CBAM(planes)
 
     def forward(self, x):
         residual = x
@@ -192,13 +192,13 @@ class Bottle2neck2D(nn.Module):
         out = self.GCS(out)
         return self.relu(out + residual)
 
-class Encoder2D(nn.Module):
+class Encoder(nn.Module):
     def __init__(self, channels, dropout_prob=0.3):
         super().__init__()
         self.blocks = nn.ModuleList([
             nn.Sequential(
-                Bottle2neck2D(channels[i], channels[i+1]),
-                Bottle2neck2D(channels[i+1], channels[i+1]),
+                Res2Block(channels[i], channels[i+1]),
+                Res2Block(channels[i+1], channels[i+1]),
                 nn.MaxPool2d(kernel_size=2, stride=2),
                 nn.Dropout(p=dropout_prob)
             ) for i in range(len(channels)-1)
@@ -223,10 +223,9 @@ class CTModel(nn.Module):
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
-            #nn.MaxPool2d(kernel_size=2, stride=2)
         )
         
-        self.encoder = Encoder2D([128, 256, 256])
+        self.encoder = Encoder([128, 256, 256])
 
         self.gap = nn.Sequential(
             #nn.Conv2d(512, 256, kernel_size=1),
@@ -526,43 +525,27 @@ if __name__ == "__main__":
         
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
-        
-        # 创建模型
         model = CTModel(num_classes=2).to(device)
-        
-        # 创建损失函数、优化器和调度器
         criterion = FocalLoss(alpha=0.25, gamma=2.0)
         optimizer = optim.Lookahead(optim.RAdam(model.parameters(), lr=args.lr))
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-        
         print(f"\n{'='*20} 开始常规训练 {'='*20}")
         start_time = time.time()
-        
-        # 训练模型
         best_f1 = 0.0
         save_path = os.path.join(args.save_dir, 'res2gcsa_best.pth')
-        
         progress_bar = tqdm(range(args.epochs), desc="训练进度", unit="epoch")
         for epoch in progress_bar:
             train_loss, acc, prec, rec, f1 = train(model, train_loader, val_loader, criterion, optimizer, scheduler, device)
-            
-            # 动态更新进度条描述
             progress_bar.set_description(
                 f"Epoch {epoch+1}/{args.epochs} | Loss: {train_loss:.4f} | Acc: {acc:.4f} | F1: {f1:.4f}"
             )
-            
-            # 保存最佳模型
             if f1 > best_f1:
                 best_f1 = f1
                 torch.save(model.state_dict(), save_path)
                 print(f"  🎉 新的最佳F1: {best_f1:.4f}, 已保存到 {save_path}")
-        
-        # 保存最终模型
         final_save_path = os.path.join(args.save_dir, 'res2gcsa_final.pth')
         torch.save(model.state_dict(), final_save_path)
         print(f"最终模型已保存到: {final_save_path}")
-        
-        # 打印总运行时间
         elapsed_time = time.time() - start_time
         hours, remainder = divmod(elapsed_time, 3600)
         minutes, seconds = divmod(remainder, 60)

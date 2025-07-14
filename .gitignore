@@ -1,5 +1,7 @@
 results/
 cfDNA/cancer_and_benign_pretrained/
+cfDNA/cancer_and_normal_pretrained/
+cfDNA/subtype_pretrained/
 CT/swin_checkpoint/
 CT/cv_checkpoints/
 visualization/
@@ -8,5 +10,3 @@ DETR/datadir/
 DETR/database/
 DETR/RunLog/
 DETR/checkpoint/
-cancer_benign_results/
-subtype_results/

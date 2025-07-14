@@ -8,15 +8,14 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, SubsetRandomSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.metrics import f1_score, roc_auc_score, roc_curve, auc
-from sklearn.model_selection import KFold
 import matplotlib.pyplot as plt
 from tabulate import tabulate
 import json
 from datetime import datetime
-
+from sklearn.model_selection import StratifiedKFold
 # ==================== Model Components ====================
 
-class ChannelAttention2D(nn.Module):
+class ChannelAttention(nn.Module):
     def __init__(self, inplanes, reduction=16):
         super().__init__()
         self.conv_mask = nn.Conv2d(inplanes, 1, kernel_size=1)
@@ -43,7 +42,7 @@ class ChannelAttention2D(nn.Module):
         channel_mul_term = self.sigmoid(self.channel_mul_conv(context))
         return x * channel_mul_term
 
-class SpatialAttention2D(nn.Module):
+class SpatialAttention(nn.Module):
     def __init__(self, kernel_size=7):
         super().__init__()
         padding = 3 if kernel_size == 7 else 1
@@ -56,18 +55,18 @@ class SpatialAttention2D(nn.Module):
         x_cat = torch.cat([max_out, avg_out], dim=1)
         return x * self.sigmoid(self.conv1(x_cat))
 
-class GCSAM2D(nn.Module):
+class CBAM(nn.Module):
     def __init__(self, in_channels, reduction=16):
         super().__init__()
-        self.channel_attention = ChannelAttention2D(in_channels, reduction)
-        self.spatial_attention = SpatialAttention2D()
+        self.channel_attention = ChannelAttention(in_channels, reduction)
+        self.spatial_attention = SpatialAttention()
 
     def forward(self, x):
         x = self.channel_attention(x)
         x = self.spatial_attention(x)
         return x
 
-class Bottle2neck2D(nn.Module):
+class Res2Block(nn.Module):
     expansion = 1
     
     def __init__(self, inplanes, planes, stride=1, baseWidth=26, scale=4, stype='normal'):
@@ -100,7 +99,7 @@ class Bottle2neck2D(nn.Module):
             nn.BatchNorm2d(planes)
         ) if inplanes != planes or stride != 1 else nn.Identity()
 
-        self.GCS = GCSAM2D(planes)
+        self.GCS = CBAM(planes)
 
     def forward(self, x):
         residual = x
@@ -123,13 +122,13 @@ class Bottle2neck2D(nn.Module):
         out = self.GCS(out)
         return self.relu(out + residual)
 
-class Encoder2D(nn.Module):
+class Encoder(nn.Module):
     def __init__(self, channels, dropout_prob=0.3):
         super().__init__()
         self.blocks = nn.ModuleList([
             nn.Sequential(
-                Bottle2neck2D(channels[i], channels[i+1]),
-                Bottle2neck2D(channels[i+1], channels[i+1]),
+                Res2Block(channels[i], channels[i+1]),
+                Res2Block(channels[i+1], channels[i+1]),
                 nn.MaxPool2d(kernel_size=2, stride=2),
                 nn.Dropout(p=dropout_prob)
             ) for i in range(len(channels)-1)
@@ -140,7 +139,7 @@ class Encoder2D(nn.Module):
             x = block(x)
         return x
 
-class SEBlock1D(nn.Module):
+class SEBlock(nn.Module):
     def __init__(self, channel, reduction=16):
         super().__init__()
         self.avg_pool = nn.AdaptiveAvgPool1d(1)
@@ -174,7 +173,7 @@ class CTModel(nn.Module):
             nn.ReLU(inplace=True),
         )
         
-        self.encoder = Encoder2D([128, 256, 256])
+        self.encoder = Encoder([128, 256, 256])
         self.gap = nn.Sequential(
             nn.AdaptiveAvgPool2d((8, 8)),
             nn.Flatten(),
@@ -228,7 +227,7 @@ class CrossAttentionFusion(nn.Module):
             nn.BatchNorm1d(conv_channels),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            SEBlock1D(conv_channels),
+            SEBlock(conv_channels),
         )
         self.token_proj = nn.Linear(conv_channels, d_model)
         
@@ -295,17 +294,21 @@ class CrossAttentionFusion(nn.Module):
 
 class MultiModalDataset(Dataset):
     def __init__(self, npz_path, modalities, indices=None, include_ct=False):
-        data = np.load(npz_path)
+        data = np.load(npz_path, allow_pickle=True)  # ensure support for string arrays
         self.Xs = [data[mod] for mod in modalities]
         self.y = data['y']
         self.include_ct = include_ct
         self.ct_data = data['CT'] if include_ct and 'CT' in data else None
-            
+
+        self.id = data['id'] if 'id' in data else None
+
         if indices is not None:
             self.Xs = [x[indices] for x in self.Xs]
             self.y = self.y[indices]
             if self.ct_data is not None:
                 self.ct_data = self.ct_data[indices]
+            if self.id is not None:
+                self.id = self.id[indices]  # 👈 这行很关键
 
     def __len__(self):
         return len(self.y)
@@ -317,10 +320,13 @@ class MultiModalDataset(Dataset):
             sample['CT'] = torch.FloatTensor(self.ct_data[idx].transpose(2, 0, 1))
         
         sample['y'] = torch.tensor(self.y[idx], dtype=torch.long)
+
+        if self.id is not None:
+            sample['id'] = str(self.id[idx])  # 转字符串更保险（如果原始是bytes或numpy.str_）
+        
         return sample
 
 # ==================== Training Utilities ====================
-
 def load_encoder(mod, checkpoint_dir, latent_dim):
     ckpt = torch.load(os.path.join(checkpoint_dir, f"{mod}_encoder_best.pth"),
                      map_location="cpu", weights_only=True)
@@ -357,10 +363,12 @@ def train_epoch(model, encoders, loader, optimizer, criterion, device):
 def evaluate(model, encoders, loader, device):
     model.eval()
     all_preds, all_probs, all_labels = [], [], []
-    
+    error_cases = []
+
     with torch.no_grad():
         for batch in loader:
             yb = batch['y'].to(device)
+            ids = batch['id']
             modality_features = [encoders[mod](batch[f'X{i}'].to(device)) 
                                for i, mod in enumerate(encoders.keys()) if f'X{i}' in batch]
             
@@ -370,17 +378,27 @@ def evaluate(model, encoders, loader, device):
             
             logits = model(zs, ct_data)
             probs = torch.softmax(logits, dim=1)
-            
+            preds = logits.argmax(1)
+
             all_preds.extend(logits.argmax(1).cpu().numpy())
             all_probs.extend(probs[:, 1].cpu().numpy())
             all_labels.extend(yb.cpu().numpy())
-    
+
+            for i in range(len(yb)):
+                if preds[i] != yb[i]:
+                    error_cases.append({
+                        'id': ids[i],
+                        'true_label': yb[i].item(),
+                        'pred_label': preds[i].item(),
+                        'prob': probs[i, 1].item()
+                    })
     return {
         'f1': f1_score(all_labels, all_preds),
         'auc': roc_auc_score(all_labels, all_probs),
         'preds': all_preds,
         'probs': all_probs,
-        'labels': all_labels
+        'labels': all_labels,
+        'errors': error_cases
     }
 
 def plot_roc_curve(labels, probs, output_dir, name):
@@ -398,8 +416,18 @@ def plot_roc_curve(labels, probs, output_dir, name):
     plt.legend(loc="lower right")
     plt.savefig(os.path.join(output_dir, f'roc_curve_{name}.png'))
     plt.close()
-
 # ==================== Core Training Functions ====================
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2, weight=None):
+        super().__init__()
+        self.gamma = gamma
+        self.ce = nn.CrossEntropyLoss(weight=weight)
+
+    def forward(self, input, target):
+        logp = self.ce(input, target)
+        p = torch.exp(-logp)
+        loss = (1 - p) ** self.gamma * logp
+        return loss
 
 def run_single_fold(model, encoders, train_loader, val_loader, args, fold=None, cv_dir=None):
     cv_dir = cv_dir or os.path.join(args.output_dir, "cv_results")
@@ -413,7 +441,6 @@ def run_single_fold(model, encoders, train_loader, val_loader, args, fold=None, 
     optimizer = optim.AdamW(params, lr=args.lr)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs//3, eta_min=args.lr/10)
     criterion = nn.CrossEntropyLoss()
-    
     best_auc, best_epoch, best_results = 0, 0, None
     
     for epoch in range(1, args.epochs + 1):
@@ -436,15 +463,16 @@ def run_single_fold(model, encoders, train_loader, val_loader, args, fold=None, 
     return best_results, best_epoch
 
 def run_cross_validation(args, dataset):
-    kf = KFold(n_splits=args.k_folds, shuffle=True, random_state=42)
+    kf = StratifiedKFold(n_splits=args.k_folds, shuffle=True, random_state=42)  # ✅ 用 StratifiedKFold 替代 KFold
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     cv_dir = os.path.join(args.output_dir, f"cv_results_{timestamp}")
     os.makedirs(cv_dir, exist_ok=True)
-    
+
     # Load and configure encoders
     encoders = {mod: load_encoder(mod, args.checkpoint_dir, args.latent_dim).to(args.device) 
                for mod in args.modalities}
-    
+
     for encoder in encoders.values():
         if args.finetune:
             encoder.train()
@@ -452,15 +480,17 @@ def run_cross_validation(args, dataset):
             encoder.eval()
             for p in encoder.parameters():
                 p.requires_grad = False
-    
+
     all_results = []
-    for fold, (train_idx, val_idx) in enumerate(kf.split(dataset), 1):
+    
+    # ✅ 修改这一行，传入 dataset.y 做分层
+    for fold, (train_idx, val_idx) in enumerate(kf.split(dataset, dataset.y), 1):
         print(f"\n{'='*20} Fold {fold}/{args.k_folds} {'='*20}")
         
         train_loader = DataLoader(dataset, batch_size=args.batch_size, 
-                                 sampler=SubsetRandomSampler(train_idx))
+                                  sampler=SubsetRandomSampler(train_idx))
         val_loader = DataLoader(dataset, batch_size=args.batch_size, 
-                               sampler=SubsetRandomSampler(val_idx))
+                                sampler=SubsetRandomSampler(val_idx))
         
         model = CrossAttentionFusion(
             dim_latent=args.latent_dim,
@@ -474,11 +504,14 @@ def run_cross_validation(args, dataset):
             model, encoders, train_loader, val_loader, args, fold, cv_dir
         )
         
+        if fold_results is None:
+            print(f"[Fold {fold}] skipped due to invalid results.")
+            continue
         fold_results.update({'fold': fold, 'best_epoch': best_epoch})
         all_results.append(fold_results)
         plot_roc_curve(fold_results['labels'], fold_results['probs'], cv_dir, f"fold_{fold}")
-    
-    # Calculate and save results
+
+    # 后面无需修改
     f1_scores = [r['f1'] for r in all_results]
     auc_scores = [r['auc'] for r in all_results]
     
@@ -501,11 +534,10 @@ def run_cross_validation(args, dataset):
             'std_auc': float(np.std(auc_scores))
         }
     }
-    
+
     with open(os.path.join(cv_dir, 'results.json'), 'w') as f:
         json.dump(results_dict, f, indent=2)
-    
-    # Print results table
+
     results_table = [["Fold", "F1 Score", "AUC Score", "Best Epoch"]]
     results_table.extend([
         [r['fold'], f"{r['f1']:.3f}", f"{r['auc']:.3f}", r['best_epoch']] 
@@ -517,10 +549,10 @@ def run_cross_validation(args, dataset):
         f"{np.mean(auc_scores):.3f} ± {np.std(auc_scores):.3f}",
         "-"
     ])
-    
+
     print("\n交叉验证结果:")
     print(tabulate(results_table, headers="firstrow", tablefmt="grid"))
-    
+
     return results_dict
 
 # ==================== Main Function ====================
@@ -555,7 +587,7 @@ def main():
     # Load data
     train_dataset = MultiModalDataset(args.data_file, args.modalities, include_ct=True)
     print(f"Loaded training data: {args.data_file}, samples: {len(train_dataset)}")
-    
+    print("Label distribution:", np.unique(train_dataset.y, return_counts=True))
     if args.cross_val:
         print(f"\nRunning {args.k_folds}-fold cross-validation...")
         run_cross_validation(args, train_dataset)
@@ -565,7 +597,7 @@ def main():
     if args.test_file:
         test_dataset = MultiModalDataset(args.test_file, args.modalities, include_ct=True)
         print(f"Loaded test set: {args.test_file}, samples: {len(test_dataset)}")
-        
+        print("Label distribution:", np.unique(test_dataset.y, return_counts=True))
         if not args.eval_only:
             dataset_size = len(train_dataset)
             val_size = int(dataset_size * args.val_size)
@@ -613,7 +645,8 @@ def main():
                 'auc': float(test_results['auc']),
                 'preds': [int(p) for p in test_results['preds']],
                 'probs': [float(p) for p in test_results['probs']],
-                'labels': [int(l) for l in test_results['labels']]
+                'labels': [int(l) for l in test_results['labels']],
+                'errors': test_results.get('errors', []) 
             }
         }
         
