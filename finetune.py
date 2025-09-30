@@ -330,10 +330,18 @@ class MultiModalDataset(Dataset):
 
 # ==================== Training Utilities ====================
 def load_encoder(mod, checkpoint_dir, latent_dim):
-    ckpt = torch.load(os.path.join(checkpoint_dir, f"{mod}_encoder_best.pth"),
-                     map_location="cpu", weights_only=True)
-    encoder = ModalityEncoder(dim_in=ckpt['0.weight'].shape[1], dim_latent=latent_dim)
-    encoder.encoder.load_state_dict(ckpt)
+    # 不加载预训练权重，根据模态创建新的编码器
+    modality_dims = {
+        'Frag': 888,
+        'CNV': 21870,
+        'PFE': 19415,
+        'NDR': 19434,
+        'NDR2K': 19434
+    }
+    
+    dim_in = modality_dims.get(mod, 1000)  # 默认维度
+    encoder = ModalityEncoder(dim_in=dim_in, dim_latent=latent_dim)
+    print(f"创建新的 {mod} 编码器，输入维度: {dim_in}")
     return encoder
 
 def train_epoch(model, encoders, loader, optimizer, criterion, device):
@@ -461,6 +469,9 @@ def run_single_fold(model, encoders, train_loader, val_loader, args, fold=None, 
                 model_path = os.path.join(cv_dir if fold else args.output_dir, 
                                         f"best_model{'_fold_'+str(fold) if fold else ''}.pth")
                 torch.save(model.state_dict(), model_path)
+    
+    # 调试信息
+    print(f"Fold完成，best_results是否为None: {best_results is None}, best_auc: {best_auc}")
     
     return best_results, best_epoch
 
