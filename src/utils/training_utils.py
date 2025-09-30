@@ -14,7 +14,7 @@ from ..models.fusion_models import ModalityEncoder, CTModel
 from ..data.dataset import get_modality_dimensions
 
 
-def load_encoder(mod, checkpoint_dir=None, latent_dim=256):
+def load_encoder(mod, checkpoint_dir=None, latent_dim=256, feature_dims=None):
     """
     创建编码器（不加载预训练权重版本）
     
@@ -22,12 +22,17 @@ def load_encoder(mod, checkpoint_dir=None, latent_dim=256):
         mod: 模态名称
         checkpoint_dir: 检查点目录（现在忽略）
         latent_dim: 潜在空间维度
+        feature_dims: 实际特征维度字典（考虑特征选择后）
     
     Returns:
         ModalityEncoder: 编码器模型
     """
-    modality_dims = get_modality_dimensions()
-    dim_in = modality_dims.get(mod, 1000)  # 默认维度
+    if feature_dims and mod in feature_dims:
+        dim_in = feature_dims[mod]  # 使用特征选择后的维度
+    else:
+        modality_dims = get_modality_dimensions()
+        dim_in = modality_dims.get(mod, 1000)  # 默认维度
+    
     encoder = ModalityEncoder(dim_in=dim_in, dim_latent=latent_dim)
     print(f"创建新的 {mod} 编码器，输入维度: {dim_in}")
     return encoder

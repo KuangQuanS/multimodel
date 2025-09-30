@@ -18,7 +18,7 @@ from tabulate import tabulate
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.models.fusion_models import CrossAttentionFusion
-from src.data.dataset import load_data
+from src.data.dataset import load_data, create_feature_selectors
 from src.utils.training_utils import (
     load_encoder, create_ct_model, run_single_fold, 
     evaluate, plot_roc_curve
@@ -34,6 +34,15 @@ def parse_args():
     parser.add_argument('--test_file', type=str, help='Path to test data NPZ file')
     parser.add_argument('--modalities', nargs='+', default=['Frag', 'PFE', 'NDR', 'NDR2K'], 
                        help='List of modalities to use')
+    
+    # Feature selection parameters
+    parser.add_argument('--use_feature_selection', action='store_true', 
+                       help='Enable cfDNA feature selection')
+    parser.add_argument('--feature_selection_method', type=str, default='combined',
+                       choices=['variance', 'kbest', 'rfe', 'combined'],
+                       help='Feature selection method')
+    parser.add_argument('--k_features', type=int, default=50,
+                       help='Number of features to select per cfDNA modality')
     
     # Model parameters
     parser.add_argument('--latent_dim', type=int, default=256, help='Latent dimension for encoders')
@@ -66,7 +75,7 @@ def parse_args():
     return args
 
 
-def run_cross_validation(args, dataset):
+def run_cross_validation(args, dataset, feature_selectors=None):
     """运行交叉验证"""
     kf = StratifiedKFold(n_splits=args.k_folds, shuffle=True, random_state=42)
 
@@ -74,8 +83,16 @@ def run_cross_validation(args, dataset):
     cv_dir = os.path.join(args.output_dir, f"cv_results_{timestamp}")
     os.makedirs(cv_dir, exist_ok=True)
 
+    # 获取实际特征维度
+    feature_dims = {}
+    if feature_selectors:
+        # 通过检查数据集来获取特征选择后的维度
+        sample = dataset[0]
+        for i, mod in enumerate(args.modalities):
+            feature_dims[mod] = sample[f'X{i}'].shape[0]
+    
     # Load and configure encoders
-    encoders = {mod: load_encoder(mod, None, args.latent_dim).to(args.device) 
+    encoders = {mod: load_encoder(mod, None, args.latent_dim, feature_dims).to(args.device) 
                for mod in args.modalities}
 
     for encoder in encoders.values():
@@ -172,15 +189,28 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # Create feature selectors if enabled
+    feature_selectors = None
+    if args.use_feature_selection:
+        print("🔍 创建cfDNA特征选择器...")
+        feature_selectors = create_feature_selectors(
+            args.data_file, 
+            args.modalities, 
+            method=args.feature_selection_method,
+            k_features=args.k_features
+        )
+        print(f"特征选择方法: {args.feature_selection_method}, 每个模态保留: {args.k_features} 个特征")
+    
     # Load training data
-    train_dataset, label_dist = load_data(args.data_file, args.modalities, include_ct=True)
+    train_dataset, label_dist = load_data(args.data_file, args.modalities, 
+                                        include_ct=True, feature_selectors=feature_selectors)
     print(f"Loaded training data: {args.data_file}, samples: {len(train_dataset)}")
     print(f"Label distribution: {label_dist}")
     
     # Run cross-validation or single training
     if args.cross_val:
         print(f"\nRunning {args.k_folds}-fold cross-validation...")
-        run_cross_validation(args, train_dataset)
+        run_cross_validation(args, train_dataset, feature_selectors)
         return
     
     # Single training (not implemented in this simplified version)
