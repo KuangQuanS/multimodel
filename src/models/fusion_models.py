@@ -89,9 +89,10 @@ class CrossAttentionFusion(nn.Module):
     """交叉注意力融合模型，融合cfDNA和CT特征"""
     def __init__(self, dim_latent, n_modalities, num_classes=2, 
                  conv_channels=512, d_model=768, n_heads=4, dropout=0.3, train=True, 
-                 ct_feature_extractor=None, finetune_ct=True):
+                 ct_feature_extractor=None, finetune_ct=True, use_ct=True):
         super().__init__()
         self.training = train
+        self.use_ct = use_ct
         
         # cfDNA feature processing
         self.cfdna_conv = nn.Sequential(
@@ -103,29 +104,40 @@ class CrossAttentionFusion(nn.Module):
         )
         self.token_proj = nn.Linear(conv_channels, d_model)
         
-        # CT model components
-        assert ct_feature_extractor is not None, "ct_feature_extractor must be provided"
-        self.ct_feature_extractor = ct_feature_extractor
+        # CT model components (only if using CT)
+        if self.use_ct:
+            assert ct_feature_extractor is not None, "ct_feature_extractor must be provided when use_ct=True"
+            self.ct_feature_extractor = ct_feature_extractor
 
-        if not finetune_ct:
-            for p in self.ct_feature_extractor.parameters():
-                p.requires_grad = False
-            self.ct_feature_extractor.eval()  # 不启用 BN/Dropout 的训练行为
+            if not finetune_ct:
+                for p in self.ct_feature_extractor.parameters():
+                    p.requires_grad = False
+                self.ct_feature_extractor.eval()  # 不启用 BN/Dropout 的训练行为
 
-        self.ct_proj_k = nn.Linear(256*8*8, d_model)
-        self.ct_proj_v = nn.Linear(256*8*8, d_model)
+            self.ct_proj_k = nn.Linear(256*8*8, d_model)
+            self.ct_proj_v = nn.Linear(256*8*8, d_model)
+            
+            # Attention mechanisms
+            self.multihead_attn_cf_to_ct = nn.MultiheadAttention(d_model, n_heads, dropout, batch_first=True)
+            self.multihead_attn_ct_to_cf = nn.MultiheadAttention(d_model, n_heads, dropout, batch_first=True)
+            
+            # Fusion layer for CT+cfDNA
+            self.fusion_layer = nn.Sequential(
+                nn.Linear(d_model * 2, 256),
+                nn.LayerNorm(256),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
+        else:
+            # cfDNA-only fusion layer
+            self.fusion_layer = nn.Sequential(
+                nn.Linear(d_model, 256),
+                nn.LayerNorm(256),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
         
-        # Attention mechanisms
-        self.multihead_attn_cf_to_ct = nn.MultiheadAttention(d_model, n_heads, dropout, batch_first=True)
-        self.multihead_attn_ct_to_cf = nn.MultiheadAttention(d_model, n_heads, dropout, batch_first=True)
-        
-        # Fusion and classification
-        self.fusion_layer = nn.Sequential(
-            nn.Linear(d_model * 2, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
+        # Classification head
         self.classifier = nn.Sequential(
             nn.Linear(256, 128),
             nn.Dropout(dropout),
@@ -140,11 +152,13 @@ class CrossAttentionFusion(nn.Module):
         x = self.cfdna_conv(zs.permute(0, 2, 1)).permute(0, 2, 1)
         cfdna_tokens = self.token_proj(x)
 
-        if ct_images is None:
-            pooled = cfdna_tokens.mean(dim=1)
-            fused = self.fusion_layer(torch.cat([pooled, pooled], dim=1))
+        # cfDNA-only mode
+        if not self.use_ct or ct_images is None:
+            pooled = cfdna_tokens.mean(dim=1)  # Global average pooling
+            fused = self.fusion_layer(pooled)
             return self.classifier(fused)
 
+        # CT+cfDNA mode with cross-attention
         # CT feature extraction
         ct_feat = self.ct_feature_extractor(ct_images)
         ct_feat_proj = self.ct_proj_v(ct_feat)

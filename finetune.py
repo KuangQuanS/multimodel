@@ -49,6 +49,7 @@ def parse_args():
     parser.add_argument('--ct_model_path', type=str, help='Path to pretrained CT model')
     parser.add_argument('--finetune', action='store_true', help='Finetune encoders')
     parser.add_argument('--finetune_ct', action='store_true', help='Finetune CT model')
+    parser.add_argument('--no_ct', action='store_true', help='Disable CT data and cross-attention (cfDNA only mode)')
     
     # Training parameters
     parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs')
@@ -90,6 +91,7 @@ def evaluate_test_set(args, feature_selectors, cv_results):
         test_dataset, test_label_dist = load_data(
             args.test_file, 
             args.modalities, 
+            include_ct=not args.no_ct,
             feature_selectors=feature_selectors
         )
         print(f"✅ 测试集加载成功，样本数: {len(test_dataset)}")
@@ -107,6 +109,7 @@ def evaluate_test_set(args, feature_selectors, cv_results):
             test_dataset, test_label_dist = load_data(
                 args.test_file, 
                 args.modalities, 
+                include_ct=not args.no_ct,
                 feature_selectors=None
             )
             print(f"✅ 测试集加载成功 (无特征选择)，样本数: {len(test_dataset)}")
@@ -156,13 +159,14 @@ def evaluate_test_set(args, feature_selectors, cv_results):
         return
     
     # Create model
-    ct_model = create_ct_model(args.ct_model_path, args.finetune_ct)
+    ct_model = None if args.no_ct else create_ct_model(args.ct_model_path, args.finetune_ct)
     model = CrossAttentionFusion(
         dim_latent=args.latent_dim,
         n_modalities=len(args.modalities),
         num_classes=2,
         ct_feature_extractor=ct_model,
-        finetune_ct=args.finetune_ct
+        finetune_ct=args.finetune_ct,
+        use_ct=not args.no_ct
     ).to(args.device)
     
     # Load best model weights
@@ -234,8 +238,8 @@ def run_cross_validation(args, dataset, feature_selectors=None):
             for p in encoder.parameters():
                 p.requires_grad = False
 
-    # Load CT model
-    ct_model = create_ct_model(args.ct_model_path, args.device)
+    # Load CT model (only if not in no_ct mode)
+    ct_model = None if args.no_ct else create_ct_model(args.ct_model_path, args.device)
     
     all_results = []
     
@@ -254,7 +258,8 @@ def run_cross_validation(args, dataset, feature_selectors=None):
             n_modalities=len(args.modalities),  # Number of modalities
             num_classes=2,
             ct_feature_extractor=ct_model,
-            finetune_ct=args.finetune_ct
+            finetune_ct=args.finetune_ct,
+            use_ct=not args.no_ct
         ).to(args.device)
         
         fold_results, best_epoch = run_single_fold(
@@ -353,7 +358,7 @@ def main():
     
     # Load training data
     train_dataset, label_dist = load_data(args.data_file, args.modalities, 
-                                        include_ct=True, feature_selectors=feature_selectors)
+                                        include_ct=not args.no_ct, feature_selectors=feature_selectors)
     print(f"Loaded training data: {args.data_file}, samples: {len(train_dataset)}")
     print(f"Label distribution: {label_dist}")
     
