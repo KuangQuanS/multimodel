@@ -45,8 +45,7 @@ class ModelEvaluator:
             num_classes=2,
             ct_feature_extractor=ct_model,
             finetune_ct=self.args.finetune_ct,
-            use_ct=not self.args.no_ct,
-            use_se_block=not self.args.no_se_block
+            use_ct=not self.args.no_ct
         ).to(self.args.device)
         
         return model, encoders
@@ -67,16 +66,16 @@ class ModelEvaluator:
         # 评估
         results = evaluate(model, encoders, test_loader, self.args.device)
         
-        # 添加调试信息
-        logger.info(f"单模型 Fold {fold_num} 测试集结果详情:")
-        logger.info(f"  样本数: {len(results['labels'])}")
-        unique_preds, pred_counts = np.unique(results['preds'], return_counts=True)
-        unique_labels, label_counts = np.unique(results['labels'], return_counts=True)
-        logger.info(f"  预测分布: {dict(zip(unique_preds, pred_counts))}")
-        logger.info(f"  标签分布: {dict(zip(unique_labels, label_counts))}")
-        probs_array = np.array(results['probs'])
-        logger.info(f"  概率范围: [{probs_array.min():.4f}, {probs_array.max():.4f}]")
-        logger.info(f"  概率均值: {probs_array.mean():.4f} ± {probs_array.std():.4f}")
+        # # 添加调试信息
+        # logger.info(f"单模型 Fold {fold_num} 测试集结果详情:")
+        # logger.info(f"  样本数: {len(results['labels'])}")
+        # unique_preds, pred_counts = np.unique(results['preds'], return_counts=True)
+        # unique_labels, label_counts = np.unique(results['labels'], return_counts=True)
+        # logger.info(f"  预测分布: {dict(zip(unique_preds, pred_counts))}")
+        # logger.info(f"  标签分布: {dict(zip(unique_labels, label_counts))}")
+        # probs_array = np.array(results['probs'])
+        # logger.info(f"  概率范围: [{probs_array.min():.4f}, {probs_array.max():.4f}]")
+        # logger.info(f"  概率均值: {probs_array.mean():.4f} ± {probs_array.std():.4f}")
         
         return results
     
@@ -143,7 +142,6 @@ class ModelEvaluator:
         logger.info(f"集成预测分布: {dict(zip(unique_preds, pred_counts))}")
         logger.info(f"真实标签分布: {dict(zip(unique_labels, label_counts))}")
         logger.info(f"集成概率范围: [{ensemble_probs_pos.min():.4f}, {ensemble_probs_pos.max():.4f}]")
-        logger.info(f"集成概率均值: {ensemble_probs_pos.mean():.4f} ± {ensemble_probs_pos.std():.4f}")
         
         # 检查是否所有样本都被预测为同一类
         if len(unique_preds) == 1:

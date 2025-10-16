@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, SubsetRandomSampler
-from sklearn.metrics import f1_score, roc_auc_score, roc_curve, auc
+from sklearn.metrics import f1_score, roc_auc_score, roc_curve, auc, recall_score
 import matplotlib.pyplot as plt
 import numpy as np
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -22,7 +22,13 @@ plt.switch_backend('Agg')
 
 class FocalLoss(nn.Module):
     """
+    Focal Loss for addressing class imbalance
     论文: Focal Loss for Dense Object Detection (https://arxiv.org/abs/1708.02002)
+    
+    Args:
+        alpha: 类权重，可以是float或tensor
+        gamma: 调节难易样本权重的参数，越大越关注困难样本
+        reduction: 'mean', 'sum' 或 'none'
     """
     
     def __init__(self, alpha=1.0, gamma=2.0, reduction='mean'):
@@ -32,22 +38,28 @@ class FocalLoss(nn.Module):
         self.reduction = reduction
     
     def forward(self, inputs, targets):
+        # 计算交叉熵损失（不进行reduction）
         ce_loss = F.cross_entropy(inputs, targets, reduction='none')
-
+        
+        # 计算概率
         p = F.softmax(inputs, dim=1)
         p_t = p.gather(1, targets.unsqueeze(1)).squeeze(1)
-
+        
+        # 计算focal weight: (1 - p_t)^gamma
         focal_weight = (1 - p_t) ** self.gamma
-        if isinstance(self.alpha, (list, np.ndarray, torch.Tensor)):
-            if isinstance(self.alpha, (list, np.ndarray)):
-                alpha_t = torch.tensor(self.alpha, device=inputs.device)[targets]
-            else:
-                alpha_t = self.alpha[targets]
+        
+        # 处理alpha权重
+        if isinstance(self.alpha, (list, np.ndarray)):
+            alpha_t = torch.tensor(self.alpha, device=inputs.device, dtype=torch.float32)[targets]
+        elif isinstance(self.alpha, torch.Tensor):
+            alpha_t = self.alpha[targets]
         else:
             alpha_t = self.alpha
             
+        # 计算最终的focal loss
         focal_loss = alpha_t * focal_weight * ce_loss
         
+        # 应用reduction
         if self.reduction == 'mean':
             return focal_loss.mean()
         elif self.reduction == 'sum':
@@ -92,8 +104,11 @@ def train_epoch(model, encoders, loader, optimizer, criterion, device, l1_lambda
         # L1
         if l1_lambda > 0:
             l1_regularization = 0.0
+            param_count = 0
             for param in model.parameters():
                 l1_regularization += torch.sum(torch.abs(param))
+                param_count += param.numel()
+            l1_regularization = l1_regularization / param_count if param_count > 0 else l1_regularization
             loss += l1_lambda * l1_regularization
             
         loss.backward()
@@ -205,9 +220,14 @@ def evaluate(model, encoders, loader, device, criterion=None):
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     
+    # 计算recall（召回率）
+    recall = recall_score(all_labels, all_preds, average='binary' if len(set(all_labels)) == 2 else 'macro')
+    
     return {
         'accuracy': accuracy,
+        'val_accuracy': accuracy,  # 验证集准确率，与accuracy相同
         'f1': f1_score(all_labels, all_preds),
+        'recall': recall,  # 召回率
         'auc': auc_score,
         'loss': avg_loss,
         'preds': all_preds,
@@ -217,7 +237,7 @@ def evaluate(model, encoders, loader, device, criterion=None):
     }
 
 
-def run_single_fold(model, encoders, train_loader, val_loader, args, fold=None, cv_dir=None):
+def run_single_fold(model, encoders, train_loader, val_loader, args, fold=None, cv_dir=None, auto_class_weights=False):
     """运行单折训练"""
     cv_dir = cv_dir or os.path.join(args.output_dir, "cv_results")
     
@@ -231,68 +251,39 @@ def run_single_fold(model, encoders, train_loader, val_loader, args, fold=None, 
 
     T_max = max(1, args.epochs//3)  # 确保T_max至少为1
     scheduler = CosineAnnealingLR(optimizer, T_max=T_max, eta_min=args.lr/10)
+    # 统计标签分布
+    train_labels = []
+    for batch in train_loader:
+        train_labels.extend(batch['y'].cpu().numpy().tolist())
     
-    # Automatic class weight calculation (默认启用)
-    auto_class_weights = getattr(args, 'auto_class_weights', True)  
+    from collections import Counter
+    class_counts = Counter(train_labels)
+    n_classes = len(class_counts)
+    n_samples = len(train_labels)
     
+    # 计算 class weight = N / (K * count)
+    class_weights = []
+    for i in range(n_classes):
+        class_weights.append(n_samples / (n_classes * class_counts[i]))
+    
+    class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(args.device)
+
     if auto_class_weights:
-        # Calculate class weights based on training data distribution
-        train_labels = []
-        for batch in train_loader:
-            train_labels.extend(batch['y'].cpu().numpy().tolist())  # Labels are in 'y' key
-        
-        # Count class frequencies
-        from collections import Counter
-        class_counts = Counter(train_labels)
-        n_classes = len(class_counts)
-        n_samples = len(train_labels)
-        
-        # Calculate inverse frequency weights: weight = n_samples / (n_classes * count)
-        class_weights = []
-        for i in range(n_classes):
-            weight = n_samples / (n_classes * class_counts[i])
-            class_weights.append(weight)
-        
-        print(f"Class distribution: {dict(class_counts)}")
-        print(f"Auto-calculated class weights: {[f'{w:.3f}' for w in class_weights]}")
-    
-    # Create criterion - Focal Loss or CrossEntropyLoss
-    if hasattr(args, 'use_focal_loss') and args.use_focal_loss:
-        # Use Focal Loss for imbalanced data
-        if auto_class_weights:
-            alpha = torch.tensor(class_weights, dtype=torch.float32).to(args.device)
-        elif hasattr(args, 'use_class_weights') and args.use_class_weights:
-            alpha = torch.tensor(args.class_weights, dtype=torch.float32).to(args.device)
-        else:
-            alpha = args.focal_alpha if hasattr(args, 'focal_alpha') else 1.0
-            
-        gamma = args.focal_gamma if hasattr(args, 'focal_gamma') else 2.0
-        criterion = FocalLoss(alpha=alpha, gamma=gamma)
-        print(f"Using Focal Loss: alpha={alpha}, gamma={gamma}")
-        
-    elif auto_class_weights or (hasattr(args, 'use_class_weights') and args.use_class_weights):
-        # Use CrossEntropyLoss with class weights (auto or manual)
-        if auto_class_weights:
-            weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(args.device)
-        else:
-            weights_tensor = torch.tensor(args.class_weights, dtype=torch.float32).to(args.device)
-        
-        criterion = nn.CrossEntropyLoss(weight=weights_tensor)
-        print(f"Using weighted CrossEntropyLoss with weights: {[f'{w:.3f}' for w in weights_tensor.cpu().tolist()]}")
+        # 使用 FocalLoss
+        gamma = 2
+        criterion = FocalLoss(alpha=class_weights_tensor, gamma=gamma)
+
     else:
-        # Standard CrossEntropyLoss
-        criterion = nn.CrossEntropyLoss()
-        print("Using standard CrossEntropyLoss (no class weights)")
+        # 使用加权交叉熵
+        criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
+
     best_auc, best_epoch, best_results = 0, 0, None
     
     # Early stopping variables
     early_stopping_counter = 0
-    use_early_stopping = hasattr(args, 'early_stopping') and args.early_stopping
-    patience = getattr(args, 'patience', 10)
-    min_delta = getattr(args, 'min_delta', 0.001)
-    
-    if use_early_stopping:
-        print(f"Early stopping enabled: patience={patience}, min_delta={min_delta}")
+    use_early_stopping = True
+    patience = 10
+    min_delta = 0.001
     
     # Track training history
     train_losses, train_accs, val_losses, val_accs, val_f1s, val_aucs = [], [], [], [], [], []
@@ -327,18 +318,18 @@ def run_single_fold(model, encoders, train_loader, val_loader, args, fold=None, 
         val_f1s.append(val_results['f1'])
         val_aucs.append(val_results['auc'])
         
-        # Check for improvement and save best model
+        # 检查是否有改善并保存最佳模型
         if val_results['auc'] > best_auc + min_delta:
             best_auc = val_results['auc']
             best_epoch = epoch
             best_results = val_results
             early_stopping_counter = 0  # Reset counter on improvement
             
+            # 保存最佳模型
             model_path = os.path.join(cv_dir if fold else args.output_dir, 
                                     f"best_model{'_fold_'+str(fold) if fold else ''}.pth")
             torch.save(model.state_dict(), model_path)
-            
-                
+                    
         elif use_early_stopping:
             early_stopping_counter += 1
             if early_stopping_counter >= patience:
@@ -425,8 +416,7 @@ def plot_training_curves(results, output_dir=None, fold=None, show=False):
         filename = f"training_curves{'_fold_'+str(fold) if fold else ''}.png"
         filepath = os.path.join(results_dir, filename)
         plt.savefig(filepath, dpi=150, bbox_inches='tight')
-        print(f"📊 训练曲线已保存: {filepath}")
-    
+
     # 显示图片 (默认不显示，只保存)
     if show:
         plt.show()
@@ -494,7 +484,6 @@ def plot_all_folds_curves(all_results, output_dir=None):
         os.makedirs(os.path.join(output_dir, 'results'), exist_ok=True)
         filepath = os.path.join(output_dir, 'results', 'cross_validation_curves.png')
         plt.savefig(filepath, dpi=150, bbox_inches='tight')
-        print(f"📊 交叉验证曲线已保存: {filepath}")
     
     plt.show()
 
@@ -517,7 +506,6 @@ def plot_roc_curve(labels, probs, output_dir, suffix=""):
     roc_path = os.path.join(output_dir, f"roc_curve_{suffix}.png")
     plt.savefig(roc_path, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"📊 ROC曲线已保存: {roc_path}")
 
 
 class CTFeatureExtractor(nn.Module):
@@ -527,10 +515,10 @@ class CTFeatureExtractor(nn.Module):
         self.ct_model = ct_model
         
     def forward(self, x):
-        # 提取特征，在MLP分类器之前停止
+        # preBlock+encoder+gap，与CTModel一致
         x = self.ct_model.preBlock(x)
-        x = self.ct_model.encoder(x)  
-        x = self.ct_model.gap(x)  # 输出 [batch, 256*8*8]
+        x = self.ct_model.encoder(x)
+        x = self.ct_model.gap(x)
         return x
 
 

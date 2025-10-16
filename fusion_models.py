@@ -6,6 +6,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.models as models
 
 class ChannelAttention(nn.Module):
     def __init__(self, inplanes, reduction=16):
@@ -156,7 +157,7 @@ class Encoder(nn.Module):
 class CTModel(nn.Module):
     def __init__(self, num_classes=2):
         super().__init__()
-        
+        # preBlock: 多层卷积+BN+ReLU
         self.preBlock = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
@@ -168,16 +169,16 @@ class CTModel(nn.Module):
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
         )
-        
+
+        # Encoder结构，输入通道需与preBlock输出一致
         self.encoder = Encoder([128, 256, 256])
 
         self.gap = nn.Sequential(
-            #nn.Conv2d(512, 256, kernel_size=1),
             nn.AdaptiveAvgPool2d((8, 8)),
             nn.Flatten(),
             nn.LayerNorm(256*8*8)
         )
-        
+
         self.mlp = nn.Sequential(
             nn.Linear(256*8*8, 128),
             nn.Dropout(0.3),
@@ -252,7 +253,7 @@ class CrossAttentionFusion(nn.Module):
                     p.requires_grad = False
                 self.ct_feature_extractor.eval()  # 不启用 BN/Dropout 的训练行为
 
-            self.ct_proj_k = nn.Linear(256*8*8, d_model)
+            self.ct_proj_k = nn.Linear(256*8*8, d_model)  # 匹配CTModel输出特征维度
             self.ct_proj_v = nn.Linear(256*8*8, d_model)
             
             # Attention mechanisms
